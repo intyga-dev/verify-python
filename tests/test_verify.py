@@ -22,18 +22,20 @@ class TestVerify(unittest.TestCase):
             with self.subTest(name=case["name"]):
                 self.assertEqual(sakra_verify.stable_stringify(case["value"]), case["expected"])
 
-    def test_authorization_payloads_v3(self):
-        cases = self.vectors.get("authorizationPayloadsV3", [])
-        self.assertTrue(cases, "no v3 authorization vectors present")
+    def test_intent_payloads(self):
+        cases = self.vectors.get("intentPayloads", [])
+        self.assertTrue(cases, "no DIV intent vectors present")
         for i, case in enumerate(cases):
             inp = case["input"]
             with self.subTest(index=i):
-                result = sakra_verify.canonical_authorization_payload_v3(
-                    nonce=inp["nonce"],
+                result = sakra_verify.canonical_intent_payload(
+                    target=inp["target"],
                     action_type=inp["actionType"],
-                    action_description=inp["actionDescription"],
+                    display=inp["actionDescription"],
                     params=inp["params"],
                     requester=inp["requester"],
+                    nonce=inp["nonce"],
+                    expires_at=inp["expiresAt"],
                 )
                 self.assertEqual(result, case["expected"])
 
@@ -42,6 +44,7 @@ class TestVerify(unittest.TestCase):
             receipt = entry["receipt"]
             nonce = json.loads(receipt["canonicalPayload"]).get("nonce")
             expected = {
+                "target": receipt.get("target"),
                 "actionType": receipt.get("actionType"),
                 "params": receipt.get("params"),
                 "nonce": nonce,
@@ -53,7 +56,7 @@ class TestVerify(unittest.TestCase):
     def test_webauthn_vector(self):
         r = self.webauthn["receipt"]
         e = self.webauthn["expected"]
-        expected = {"actionType": e["actionType"], "params": e["params"], "nonce": e["nonce"]}
+        expected = {"target": e["target"], "actionType": e["actionType"], "params": e["params"], "nonce": e["nonce"]}
 
         ok = sakra_verify.verify_approval_receipt(
             r, expected, expected_origin=self.webauthn["origin"], expected_rp_id=self.webauthn["rpId"]

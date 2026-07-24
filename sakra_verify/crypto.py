@@ -4,7 +4,14 @@ import hmac
 import json
 import math
 import os
+from datetime import datetime, timezone
 from typing import Any, Dict, Tuple
+
+# DIV protocol constants (docs/DIV.md v1).
+DIV_VERSION = 1
+DIV_INTENT_TYPE = "div-intent-verification"
+# RECOMMENDED expiry tolerance in seconds (DIV §6.2).
+DEFAULT_CLOCK_SKEW_SECONDS = 30
 
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
@@ -116,6 +123,46 @@ def canonical_authorization_payload_v3(
         f'"params":{params_json},'
         f'"requester":{{"did":{did_json},"attestation":{attestation}}}'
         f'{expires_suffix}}}'
+    )
+
+def canonical_intent_payload(
+    target: str,
+    action_type: str,
+    display: str,
+    params: Dict[str, Any],
+    requester: Dict[str, Any],
+    nonce: str,
+    expires_at: str,
+) -> str:
+    """Canonical DIV Intent Payload (docs/DIV.md v1).
+
+    Byte-identical to ``canonicalIntentPayload`` in @sakra-trust/mcp-schemas, @sakra-trust/verify and
+    the Go/Rust ports. Strict RFC 8785 JCS: the WHOLE object is serialized via ``stable_stringify``,
+    which sorts every key recursively by UTF-16 code unit — so, unlike the legacy builders, key order
+    is NOT hand-templated. ``requester`` is ``{"did": str, "attestation": {...} | None}``; the null
+    attestation is load-bearing and signed.
+    """
+    attestation_val = requester.get("attestation")
+    if attestation_val is None:
+        attestation: Any = None
+    else:
+        attestation = {
+            "method": attestation_val.get("method", ""),
+            "issuer": attestation_val.get("issuer", ""),
+            "subject": attestation_val.get("subject", ""),
+        }
+    return stable_stringify(
+        {
+            "v": DIV_VERSION,
+            "type": DIV_INTENT_TYPE,
+            "target": target,
+            "actionType": action_type,
+            "display": display,
+            "params": params,
+            "requester": {"did": requester.get("did", ""), "attestation": attestation},
+            "nonce": nonce,
+            "expiresAt": expires_at,
+        }
     )
 
 def canonical_action_payload(nonce: str, action_type: str, summary: str, params: Dict[str, Any]) -> str:
@@ -277,6 +324,13 @@ def parse_cose_public_key(cose_bytes: bytes) -> Tuple[bytes, bytes]:
 
     return coordinate(-2, "x"), coordinate(-3, "y")
 
+def _parse_rfc3339(ts: str):
+    """Parse an RFC3339 timestamp to an aware datetime, or None. Accepts a trailing 'Z'."""
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
 def verify_approval_receipt(
     receipt: Dict[str, Any],
     expected: Dict[str, Any],
@@ -284,22 +338,22 @@ def verify_approval_receipt(
     expected_origin: str = None,
     expected_rp_id: str = None,
     require_user_verification: bool = True,
+    allow_expired: bool = False,
+    as_of: "datetime | None" = None,
+    clock_skew_seconds: int = DEFAULT_CLOCK_SKEW_SECONDS,
 ) -> Dict[str, Any]:
     """
-    Independently verify a signature receipt. Returns {'ok': True} or {'ok': False, 'reason': ...}.
+    Independently verify a DIV Proof Envelope. Returns {'ok': True} or {'ok': False, 'reason': ...}.
 
-    `expected` MUST carry a 'nonce' — the challenge you issued and are redeeming.
+    `expected` MUST carry 'target' and 'nonce' — the relying party's own identifier (DIV Target
+    Isolation) and the challenge you issued and are redeeming.
 
     WHAT THIS PROVES: a specific human key signed exactly this action, with exactly these params, for
-    exactly that nonce.
+    exactly this target and nonce, and the proof has not expired.
 
-    WHAT THIS DOES NOT PROVE: that the approval has not ALREADY BEEN USED. Nothing in a receipt is
-    time-bound, so a valid receipt verifies forever. Single-use enforcement lives in the gateway's
-    /authorize/verify. If you verify offline and skip that call, YOU must record redeemed nonces;
-    requiring 'nonce' here is what makes that possible.
-
-    WEBAUTHN receipts additionally require expected_origin and expected_rp_id — without them an
-    assertion harvested at any relying party would verify.
+    Expiry (DIV §5.8/§6.2) is enforced fail-closed by default; pass allow_expired=True ONLY for
+    post-hoc audit re-verification. WEBAUTHN receipts additionally require expected_origin and
+    expected_rp_id — without them an assertion harvested at any relying party would verify.
     """
     canonical_payload = receipt.get("canonicalPayload", "")
     try:
@@ -310,45 +364,50 @@ def verify_approval_receipt(
         return {"ok": False, "reason": "malformed canonicalPayload"}
     nonce = payload_data.get("nonce", "")
 
+    version = payload_data.get("v")
+    if version != DIV_VERSION:
+        shown = version if isinstance(version, int) and version else "unparseable"
+        return {"ok": False, "reason": f"unsupported DIV payload version ({shown})"}
+    if payload_data.get("type") != DIV_INTENT_TYPE:
+        return {"ok": False, "reason": "payload is not a div-intent-verification"}
+
     # Bind the receipt to the challenge the caller is redeeming, before anything else.
     if nonce != expected.get("nonce"):
         return {"ok": False, "reason": "receipt is for a different challenge"}
 
-    # Dispatch on the canonical payload version, mirroring the TS verifier. v3 additionally binds the
-    # requester, so it is rebuilt from the receipt's own requester block — not circular, since the
-    # rebuilt string must byte-match the signed bytes below, so a forged requester fails the compare.
-    version = payload_data.get("v")
-    if version not in (2, 3):
-        shown = version if isinstance(version, int) and version else "unparseable"
-        return {"ok": False, "reason": f"unsupported canonical payload version ({shown})"}
-
-    if version == 3:
-        requester = receipt.get("requester")
-        if not requester:
-            return {"ok": False, "reason": "v3 receipt missing requester"}
-        recomputed = canonical_authorization_payload_v3(
-            nonce=nonce,
-            action_type=expected.get("actionType", ""),
-            action_description=receipt.get("actionDescription", ""),
-            params=expected.get("params", {}),
-            requester=requester,
-        )
-    else:
-        recomputed = canonical_authorization_payload(
-            nonce=nonce,
-            action_type=expected.get("actionType", ""),
-            action_description=receipt.get("actionDescription", ""),
-            params=expected.get("params", {}),
-        )
+    # Rebuild the expected payload (DIV Local Payload Reconstruction). target/actionType/params come
+    # from what YOU are about to execute; display/requester/nonce/expiresAt are taken from the receipt
+    # and MUST byte-match the signed bytes below, so trusting them for the rebuild is not circular.
+    requester = receipt.get("requester")
+    if not requester:
+        return {"ok": False, "reason": "receipt missing requester"}
+    expires_at = payload_data.get("expiresAt")
+    if not isinstance(expires_at, str) or not expires_at:
+        return {"ok": False, "reason": "receipt missing expiresAt"}
+    recomputed = canonical_intent_payload(
+        target=expected.get("target", ""),
+        action_type=expected.get("actionType", ""),
+        display=receipt.get("actionDescription", ""),
+        params=expected.get("params", {}),
+        requester=requester,
+        nonce=nonce,
+        expires_at=expires_at,
+    )
     if recomputed != canonical_payload:
-        return {"ok": False, "reason": "params/actionType do not match what was approved"}
+        return {"ok": False, "reason": "target/params/actionType do not match what was approved"}
 
-    # Optional: assert WHICH workload the approval was granted to. Only v3 binds a requester, so
-    # asserting it against a v2 receipt fails rather than silently passing (v2 genuinely can't answer).
+    # Expiration (DIV §5.8/§6.2). Fail-closed by default; opt out only for audit re-verification.
+    if not allow_expired:
+        expiry = _parse_rfc3339(expires_at)
+        if expiry is None:
+            return {"ok": False, "reason": "expiresAt is not a valid RFC3339 timestamp"}
+        now = as_of or datetime.now(timezone.utc)
+        if now.timestamp() > expiry.timestamp() + clock_skew_seconds:
+            return {"ok": False, "reason": "proof has expired (pass allow_expired=True for audit re-verification)"}
+
+    # Optional: assert WHICH workload the approval was granted to.
     requester_did = expected.get("requesterDid")
     if requester_did is not None:
-        if version != 3:
-            return {"ok": False, "reason": "requesterDid asserted but receipt is v2 (no requester bound)"}
         actual_did = (receipt.get("requester") or {}).get("did")
         if actual_did != requester_did:
             return {"ok": False, "reason": "approval was requested by a different principal"}
