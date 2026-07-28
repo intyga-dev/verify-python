@@ -2,7 +2,7 @@ import json
 import unittest
 from pathlib import Path
 
-import sakra_verify
+import intyga_verify
 
 
 class TestVerify(unittest.TestCase):
@@ -20,7 +20,7 @@ class TestVerify(unittest.TestCase):
     def test_stable_stringify(self):
         for case in self.vectors.get("stableStringify", []):
             with self.subTest(name=case["name"]):
-                self.assertEqual(sakra_verify.stable_stringify(case["value"]), case["expected"])
+                self.assertEqual(intyga_verify.stable_stringify(case["value"]), case["expected"])
 
     def test_intent_payloads(self):
         cases = self.vectors.get("intentPayloads", [])
@@ -28,7 +28,7 @@ class TestVerify(unittest.TestCase):
         for i, case in enumerate(cases):
             inp = case["input"]
             with self.subTest(index=i):
-                result = sakra_verify.canonical_intent_payload(
+                result = intyga_verify.canonical_intent_payload(
                     target=inp["target"],
                     action_type=inp["actionType"],
                     display=inp["actionDescription"],
@@ -50,7 +50,7 @@ class TestVerify(unittest.TestCase):
                 "nonce": nonce,
             }
             with self.subTest(name=entry["name"]):
-                result = sakra_verify.verify_approval_receipt(receipt, expected)
+                result = intyga_verify.verify_approval_receipt(receipt, expected)
                 self.assertEqual(result["ok"], entry["expectOk"], result.get("reason"))
 
     def test_webauthn_vector(self):
@@ -58,17 +58,17 @@ class TestVerify(unittest.TestCase):
         e = self.webauthn["expected"]
         expected = {"target": e["target"], "actionType": e["actionType"], "params": e["params"], "nonce": e["nonce"]}
 
-        ok = sakra_verify.verify_approval_receipt(
+        ok = intyga_verify.verify_approval_receipt(
             r, expected, expected_origin=self.webauthn["origin"], expected_rp_id=self.webauthn["rpId"]
         )
         self.assertTrue(ok["ok"], ok.get("reason"))
 
         # Fails closed without origin/RP-ID pinning.
-        unpinned = sakra_verify.verify_approval_receipt(r, expected)
+        unpinned = intyga_verify.verify_approval_receipt(r, expected)
         self.assertFalse(unpinned["ok"])
 
         # Rejects an assertion presented for a different origin.
-        wrong = sakra_verify.verify_approval_receipt(
+        wrong = intyga_verify.verify_approval_receipt(
             r, expected, expected_origin="https://evil.example.com", expected_rp_id=self.webauthn["rpId"]
         )
         self.assertFalse(wrong["ok"])

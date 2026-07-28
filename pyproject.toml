@@ -3,13 +3,13 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sakra-verify"
+name = "intyga-verify"
 version = "0.1.0"
-description = "Zero-config offline verifier for SÄKRA approval receipts"
+description = "Zero-config offline verifier for Intyga approval receipts"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 dependencies = ["cryptography>=40.0.0"]
 
 [tool.setuptools]
-packages = ["sakra_verify"]
+packages = ["intyga_verify"]

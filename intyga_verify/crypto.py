@@ -95,8 +95,8 @@ def canonical_authorization_payload_v3(
 ) -> str:
     """v3 canonical authorization payload — v2 plus WHO REQUESTED the action.
 
-    Byte-identical to ``canonicalAuthorizationPayloadV3`` in @sakra-trust/mcp-schemas and
-    @sakra-trust/verify. ``requester`` is ``{"did": str, "attestation": {"method","issuer","subject"}
+    Byte-identical to ``canonicalAuthorizationPayloadV3`` in @intyga/mcp-schemas and
+    @intyga/verify. ``requester`` is ``{"did": str, "attestation": {"method","issuer","subject"}
     | None}``. The requester block is hand-concatenated with a FIXED key order (``did`` then
     ``attestation``; and within an attestation, ``method``, ``issuer``, ``subject``) — it deliberately
     does NOT go through ``stable_stringify``, because key order is part of the signed contract. When the
@@ -131,16 +131,23 @@ def canonical_intent_payload(
     display: str,
     params: Dict[str, Any],
     requester: Dict[str, Any],
+    requirement: Dict[str, Any],
     nonce: str,
     expires_at: str,
 ) -> str:
     """Canonical DIV Intent Payload (docs/DIV.md v1).
 
-    Byte-identical to ``canonicalIntentPayload`` in @sakra-trust/mcp-schemas, @sakra-trust/verify and
+    Byte-identical to ``canonicalIntentPayload`` in @intyga/mcp-schemas, @intyga/verify and
     the Go/Rust ports. Strict RFC 8785 JCS: the WHOLE object is serialized via ``stable_stringify``,
     which sorts every key recursively by UTF-16 code unit — so, unlike the legacy builders, key order
     is NOT hand-templated. ``requester`` is ``{"did": str, "attestation": {...} | None}``; the null
     attestation is load-bearing and signed.
+
+    ``requirement`` is the approval policy in force (quorum, four-eyes, hardware class), frozen at
+    challenge creation. It is signed so the approver attests to the policy their signature is counted
+    toward, and so a relying party can check the quorum offline instead of trusting the gateway for it.
+    ``allowedAaguids`` is sorted here: the SET is the policy, and an unordered list would make two
+    identical policies produce different signed bytes.
     """
     attestation_val = requester.get("attestation")
     if attestation_val is None:
@@ -160,6 +167,12 @@ def canonical_intent_payload(
             "display": display,
             "params": params,
             "requester": {"did": requester.get("did", ""), "attestation": attestation},
+            "requirement": {
+                "requiredApprovals": requirement.get("requiredApprovals", 1),
+                "requireHardwareKey": requirement.get("requireHardwareKey", False),
+                "allowedAaguids": sorted(requirement.get("allowedAaguids", [])),
+                "requesterCannotApprove": requirement.get("requesterCannotApprove", False),
+            },
             "nonce": nonce,
             "expiresAt": expires_at,
         }
@@ -341,15 +354,25 @@ def verify_approval_receipt(
     allow_expired: bool = False,
     as_of: "datetime | None" = None,
     clock_skew_seconds: int = DEFAULT_CLOCK_SKEW_SECONDS,
+    allow_cross_origin: bool = False,
 ) -> Dict[str, Any]:
     """
     Independently verify a DIV Proof Envelope. Returns {'ok': True} or {'ok': False, 'reason': ...}.
 
-    `expected` MUST carry 'target' and 'nonce' — the relying party's own identifier (DIV Target
-    Isolation) and the challenge you issued and are redeeming.
+    `expected` MUST carry 'target', 'nonce' and 'approvers' — the relying party's own identifier
+    (DIV Target Isolation), the challenge you issued and are redeeming, and the approver keys you
+    trust.
 
-    WHAT THIS PROVES: a specific human key signed exactly this action, with exactly these params, for
-    exactly this target and nonce, and the proof has not expired.
+    THE TRUST ANCHOR IS NOT OPTIONAL. `expected['approvers']` is either
+    ``{"publicKeys": [b64, ...]}`` or ``{"dids": [...], "resolveKey": callable}``. Verification uses
+    the key YOU resolve, never ``receipt['signerPublicKey']``: a receipt checked against its own
+    embedded key proves only internal consistency, and per the DIV threat model anyone who can hand
+    you a receipt (including the untrusted agent) could have minted that keypair themselves.
+
+    WHAT THIS PROVES: enough approvers you already trust signed exactly this action, with exactly
+    these params, for exactly this target and nonce; the number of distinct valid signatures meets the
+    quorum recorded in the signed payload; the requester did not self-approve when the signed policy
+    forbids it; and the proof has not expired.
 
     Expiry (DIV §5.8/§6.2) is enforced fail-closed by default; pass allow_expired=True ONLY for
     post-hoc audit re-verification. WEBAUTHN receipts additionally require expected_origin and
@@ -381,15 +404,28 @@ def verify_approval_receipt(
     requester = receipt.get("requester")
     if not requester:
         return {"ok": False, "reason": "receipt missing requester"}
+    approvers = expected.get("approvers")
+    if not isinstance(approvers, dict) or not (approvers.get("publicKeys") or approvers.get("dids")):
+        return {
+            "ok": False,
+            "reason": "expected['approvers'] is required — the Approver key MUST come from your own "
+                      "trust policy, never from the receipt (DIV Invariant 3)",
+        }
     expires_at = payload_data.get("expiresAt")
     if not isinstance(expires_at, str) or not expires_at:
         return {"ok": False, "reason": "receipt missing expiresAt"}
+    # The requirement is part of the SIGNED bytes, so reading it back out of the payload is not
+    # circular: a forged value changes the string and fails the byte comparison below.
+    requirement = payload_data.get("requirement")
+    if not isinstance(requirement, dict) or not isinstance(requirement.get("requiredApprovals"), int):
+        return {"ok": False, "reason": "receipt payload is missing the signed approval requirement"}
     recomputed = canonical_intent_payload(
         target=expected.get("target", ""),
         action_type=expected.get("actionType", ""),
         display=receipt.get("actionDescription", ""),
         params=expected.get("params", {}),
         requester=requester,
+        requirement=requirement,
         nonce=nonce,
         expires_at=expires_at,
     )
@@ -423,78 +459,185 @@ def verify_approval_receipt(
                 "reason": "auto-approved by policy — no human signature to verify (pass allow_auto_approved=True to accept)"
             }
 
-    signer_public_key = receipt.get("signerPublicKey")
-    signature = receipt.get("signature")
-    if not signer_public_key or not signature:
+    witnesses = _witnesses_of(receipt)
+    if not witnesses:
         return {"ok": False, "reason": "receipt missing signature material"}
 
-    if sig_alg == "WEBAUTHN":
-        authenticator_data = receipt.get("authenticatorData")
-        client_data_json = receipt.get("clientDataJSON")
-        if not authenticator_data or not client_data_json:
-            return {"ok": False, "reason": "WebAuthn receipt missing authenticatorData or clientDataJSON"}
-        # FAIL CLOSED: without an expected origin and RP ID there is nothing to pin the assertion to.
-        if not expected_origin or not expected_rp_id:
-            return {
-                "ok": False,
-                "reason": "WebAuthn receipts require expected_origin and expected_rp_id — without them "
-                          "an assertion from any relying party would verify",
-            }
-        try:
-            client_data_buf = base64_decode_flexible(client_data_json)
-            client_data = json.loads(client_data_buf.decode("utf-8"))
-
-            # An assertion, not a registration: webauthn.create signs a different ceremony over the
-            # same challenge bytes and must never be accepted as approval.
-            if client_data.get("type") != "webauthn.get":
-                return {"ok": False, "reason": "clientDataJSON is not a webauthn.get assertion"}
-            if client_data.get("origin") != expected_origin:
-                return {"ok": False, "reason": "assertion origin does not match expected_origin"}
-
-            expected_challenge = base64url_encode(canonical_payload.encode("utf-8"))
-            client_challenge_clean = client_data.get("challenge", "").replace("=", "")
-            if client_challenge_clean != expected_challenge:
-                return {"ok": False, "reason": "clientDataJSON challenge does not match canonical payload"}
-
-            # authenticatorData is signed but was previously never INSPECTED: it carries the RP ID the
-            # credential answered for and whether the user was actually present/verified.
-            auth_data_buf = base64_decode_flexible(authenticator_data)
-            if len(auth_data_buf) < 37:
-                return {"ok": False, "reason": "authenticatorData is too short"}
-            rp_id_hash = hashlib.sha256(expected_rp_id.encode("utf-8")).digest()
-            if not hmac.compare_digest(auth_data_buf[:32], rp_id_hash):
-                return {"ok": False, "reason": "authenticatorData rpIdHash does not match expected_rp_id"}
-            flags = auth_data_buf[32]
-            if not flags & AUTH_DATA_FLAG_UP:
-                return {"ok": False, "reason": "authenticatorData user-present flag is not set"}
-            if require_user_verification and not flags & AUTH_DATA_FLAG_UV:
-                return {"ok": False, "reason": "authenticatorData user-verified flag is not set"}
-
-            cose_buf = base64_decode_flexible(signer_public_key)
-            x_bytes, y_bytes = parse_cose_public_key(cose_buf)
-            x_int = int.from_bytes(x_bytes, byteorder="big")
-            y_int = int.from_bytes(y_bytes, byteorder="big")
-
-            public_numbers = ec.EllipticCurvePublicNumbers(x_int, y_int, ec.SECP256R1())
-            key_object = public_numbers.public_key()
-
-            client_data_hash = hashlib.sha256(client_data_buf).digest()
-            signature_verify_data = auth_data_buf + client_data_hash
-
-            signature_buf = base64_decode_flexible(signature)
-
-            key_object.verify(
-                signature_buf,
-                signature_verify_data,
-                ec.ECDSA(hashes.SHA256())
+    # Count DISTINCT approvers whose signature verifies under a key we independently trust. Distinct
+    # is load-bearing: without it, N copies of one approver's signature would satisfy an N-of-M quorum.
+    verified_signers = set()
+    failures = []
+    for witness in witnesses:
+        candidates, reason = _candidate_keys(approvers, witness)
+        if reason is not None:
+            failures.append(reason)
+            continue
+        matched = None
+        last_reason = "signature does not verify against any trusted approver key"
+        for key, identity in candidates:
+            ok, why = _verify_witness(
+                witness, key, canonical_payload,
+                expected_origin, expected_rp_id, require_user_verification, allow_cross_origin,
             )
-            return {"ok": True}
-        except Exception as e:
-            return {"ok": False, "reason": f"WebAuthn verification failed: {str(e)}"}
-    else:
-        if not verify_ecdsa_p256(signer_public_key, canonical_payload, signature):
-            return {"ok": False, "reason": "signature does not verify against signer key"}
-        return {"ok": True}
+            if ok:
+                matched = identity
+                break
+            last_reason = why
+        if matched is None:
+            failures.append(last_reason)
+            continue
+        # A hardware-key policy is only partially checkable offline: a bare P-256 key carries no
+        # attestation at all, so it can never satisfy the requirement, while a WebAuthn assertion is
+        # accepted without proving the authenticator's model.
+        if requirement.get("requireHardwareKey") is True and witness.get("sigAlg") != "WEBAUTHN":
+            failures.append(
+                f"signer {witness.get('signerDid')} used a bare key, but the signed policy requires "
+                "a hardware-backed WebAuthn credential"
+            )
+            continue
+        # Four-eyes, verified offline against the requester in the same signed payload.
+        if requirement.get("requesterCannotApprove") is True and witness.get("signerDid") == requester.get("did"):
+            failures.append(f"four-eyes: requester {witness.get('signerDid')} cannot approve their own action")
+            continue
+        verified_signers.add(matched)
+
+    required = max(1, int(requirement.get("requiredApprovals", 1)))
+    if len(verified_signers) < required:
+        detail = f" ({'; '.join(failures)})" if failures else ""
+        return {
+            "ok": False,
+            "reason": f"quorum not met: {len(verified_signers)} of {required} required approver signatures verified{detail}",
+        }
+    return {"ok": True, "signers": sorted(verified_signers)}
+
+def _witnesses_of(receipt: Dict[str, Any]) -> list:
+    """Normalize a receipt to a witness list: ``signatures`` if present, else the single-sig fields."""
+    sigs = receipt.get("signatures")
+    if isinstance(sigs, list) and sigs:
+        return sigs
+    if receipt.get("signerPublicKey") and receipt.get("signature"):
+        return [{
+            "signerDid": receipt.get("signerDid") or "",
+            "signerPublicKey": receipt.get("signerPublicKey"),
+            "signature": receipt.get("signature"),
+            "sigAlg": receipt.get("sigAlg"),
+            "authenticatorData": receipt.get("authenticatorData"),
+            "clientDataJSON": receipt.get("clientDataJSON"),
+        }]
+    return []
+
+def _candidate_keys(approvers: Dict[str, Any], witness: Dict[str, Any]):
+    """
+    The keys we will accept this witness under, drawn ENTIRELY from the caller's trust anchor.
+
+    ``witness['signerPublicKey']`` is never used as a verification key — only, in DID mode, as a claim
+    about WHICH approver is speaking, which we answer with the caller's own resolver. Returns
+    ``(candidates, None)`` or ``(None, reason)``; each candidate is ``(key, identity)`` so quorum
+    counts distinct APPROVERS. In publicKeys mode the identity is the key itself, because the
+    receipt's ``signerDid`` is an unverified string there and counting it would let one approver
+    claim to be three.
+    """
+    public_keys = approvers.get("publicKeys")
+    if public_keys is not None:
+        if not public_keys:
+            return None, "trusted approver allowlist is empty"
+        return [(k, k) for k in public_keys], None
+    dids = approvers.get("dids") or []
+    resolve = approvers.get("resolveKey") or approvers.get("resolve_key")
+    signer_did = witness.get("signerDid")
+    if not signer_did or signer_did not in dids:
+        return None, f"signer {signer_did or '(unknown)'} is not an authorized approver"
+    if not callable(resolve):
+        return None, "approvers.dids requires a resolveKey callable"
+    resolved = resolve(signer_did)
+    if not resolved:
+        return None, f"no trusted key could be resolved for {signer_did}"
+    return [(resolved, signer_did)], None
+
+def _verify_witness(
+    witness: Dict[str, Any],
+    trusted_key: str,
+    canonical_payload: str,
+    expected_origin,
+    expected_rp_id,
+    require_user_verification: bool,
+    allow_cross_origin: bool,
+):
+    """Verify one witness signature using an already-TRUSTED key. Returns ``(ok, reason)``."""
+    signature = witness.get("signature")
+    if not signature:
+        return False, "witness missing signature"
+
+    if witness.get("sigAlg") != "WEBAUTHN":
+        if not verify_ecdsa_p256(trusted_key, canonical_payload, signature):
+            return False, "signature does not verify against the trusted signer key"
+        return True, None
+
+    authenticator_data = witness.get("authenticatorData")
+    client_data_json = witness.get("clientDataJSON")
+    if not authenticator_data or not client_data_json:
+        return False, "WebAuthn witness missing authenticatorData or clientDataJSON"
+    # FAIL CLOSED: without an expected origin and RP ID there is nothing to pin the assertion to.
+    if not expected_origin or not expected_rp_id:
+        return False, (
+            "WebAuthn receipts require expected_origin and expected_rp_id — without them "
+            "an assertion from any relying party would verify"
+        )
+    try:
+        client_data_buf = base64_decode_flexible(client_data_json)
+        client_data = json.loads(client_data_buf.decode("utf-8"))
+
+        # An assertion, not a registration: webauthn.create signs a different ceremony over the
+        # same challenge bytes and must never be accepted as approval.
+        if client_data.get("type") != "webauthn.get":
+            return False, "clientDataJSON is not a webauthn.get assertion"
+        if client_data.get("origin") != expected_origin:
+            return False, "assertion origin does not match expected_origin"
+        # origin and rpIdHash both match for an embedded RP frame, so crossOrigin is the only signal
+        # separating "approved on our page" from "approved inside someone else's page"
+        # (W3C WebAuthn L3 §7.2 step 9).
+        if client_data.get("crossOrigin") is True and not allow_cross_origin:
+            return False, "assertion was produced in a cross-origin frame (crossOrigin=true)"
+
+        expected_challenge = base64url_encode(canonical_payload.encode("utf-8"))
+        client_challenge_clean = client_data.get("challenge", "").replace("=", "")
+        if client_challenge_clean != expected_challenge:
+            return False, "clientDataJSON challenge does not match canonical payload"
+
+        # authenticatorData is signed but was previously never INSPECTED: it carries the RP ID the
+        # credential answered for and whether the user was actually present/verified.
+        auth_data_buf = base64_decode_flexible(authenticator_data)
+        if len(auth_data_buf) < 37:
+            return False, "authenticatorData is too short"
+        rp_id_hash = hashlib.sha256(expected_rp_id.encode("utf-8")).digest()
+        if not hmac.compare_digest(auth_data_buf[:32], rp_id_hash):
+            return False, "authenticatorData rpIdHash does not match expected_rp_id"
+        flags = auth_data_buf[32]
+        if not flags & AUTH_DATA_FLAG_UP:
+            return False, "authenticatorData user-present flag is not set"
+        if require_user_verification and not flags & AUTH_DATA_FLAG_UV:
+            return False, "authenticatorData user-verified flag is not set"
+
+        # The COSE key is parsed from the TRUSTED key, not the receipt's copy.
+        cose_buf = base64_decode_flexible(trusted_key)
+        x_bytes, y_bytes = parse_cose_public_key(cose_buf)
+        x_int = int.from_bytes(x_bytes, byteorder="big")
+        y_int = int.from_bytes(y_bytes, byteorder="big")
+
+        public_numbers = ec.EllipticCurvePublicNumbers(x_int, y_int, ec.SECP256R1())
+        key_object = public_numbers.public_key()
+
+        client_data_hash = hashlib.sha256(client_data_buf).digest()
+        signature_verify_data = auth_data_buf + client_data_hash
+
+        key_object.verify(
+            base64_decode_flexible(signature),
+            signature_verify_data,
+            ec.ECDSA(hashes.SHA256())
+        )
+        return True, None
+    except Exception as e:
+        return False, f"WebAuthn verification failed: {str(e)}"
 
 # ── Policy Crypto Namespace ───────────────────────────────────────────────────
 
