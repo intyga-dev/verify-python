@@ -10,6 +10,24 @@ from typing import Any, Dict, Tuple
 # DIV protocol constants (docs/DIV.md v1).
 DIV_VERSION = 1
 DIV_INTENT_TYPE = "div-intent-verification"
+# Sealed break-glass: an approval signed ahead of time for a pre-declared emergency runbook and
+# verified offline while the gateway is unreachable. The distinct type is INSIDE the signed bytes, so
+# a sealed token can never verify as a normal approval, or the reverse. Mirrors @intyga/verify.
+# Offline approval (DIV §5a.2): a normal quorum approval collected OUT OF BAND at incident time
+# because the gateway is unreachable. The relying party builds the challenge itself, humans sign it on
+# a disconnected device, and this verifier checks the result. The distinct type lives INSIDE the signed
+# bytes, so an offline proof can never verify as a normal approval, or the reverse.
+DIV_OFFLINE_INTENT_TYPE = "div-offline-intent"
+# Delegation (DIV §5a.5): a pre-signed statement transferring the AUTHORITY TO APPROVE one
+# pre-declared action to named local operators. It authorizes NOTHING on its own —
+# verify_approval_receipt refuses this type outright, with no opt-in. Use verify_delegation.
+DIV_DELEGATION_TYPE = "div-delegation"
+# Hard cap on an offline proof's validity window, enforced at verification and not only at mint. An
+# offline relying party has no revocation channel, so the short window is the only bound (DIV §5a.3).
+MAX_OFFLINE_WINDOW_MINUTES = 60
+# Hard cap on a delegation's window (DIV §5a.6). Hours, not weeks: a delegation cannot be recalled
+# from a relying party that is offline.
+MAX_DELEGATION_WINDOW_HOURS = 72
 # RECOMMENDED expiry tolerance in seconds (DIV §6.2).
 DEFAULT_CLOCK_SKEW_SECONDS = 30
 
@@ -149,6 +167,34 @@ def canonical_intent_payload(
     ``allowedAaguids`` is sorted here: the SET is the policy, and an unordered list would make two
     identical policies produce different signed bytes.
     """
+    req, rq = _canonical_common(requester, requirement)
+    return stable_stringify(
+        {
+            "v": DIV_VERSION,
+            "type": DIV_INTENT_TYPE,
+            "target": target,
+            "actionType": action_type,
+            "display": display,
+            "params": params,
+            "requester": req,
+            "requirement": rq,
+            "nonce": nonce,
+            "expiresAt": expires_at,
+        }
+    )
+
+
+
+def _canonical_common(
+    requester: Dict[str, Any], requirement: Dict[str, Any]
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """The requester + requirement projection shared by all three canonical builders.
+
+    One definition rather than three copies: these bytes are the contract, and a field added to one
+    builder but not the others is exactly the drift the cross-language vectors exist to catch.
+    ``allowedAaguids`` is sorted because the SET is the policy — an unordered list would make two
+    identical policies produce different signed bytes.
+    """
     attestation_val = requester.get("attestation")
     if attestation_val is None:
         attestation: Any = None
@@ -158,25 +204,96 @@ def canonical_intent_payload(
             "issuer": attestation_val.get("issuer", ""),
             "subject": attestation_val.get("subject", ""),
         }
+    return (
+        {"did": requester.get("did", ""), "attestation": attestation},
+        {
+            "requiredApprovals": requirement.get("requiredApprovals", 1),
+            "requireHardwareKey": requirement.get("requireHardwareKey", False),
+            "allowedAaguids": sorted(requirement.get("allowedAaguids", [])),
+            "requesterCannotApprove": requirement.get("requesterCannotApprove", False),
+        },
+    )
+
+
+def canonical_offline_intent_payload(
+    target: str,
+    action_type: str,
+    display: str,
+    params: Dict[str, Any],
+    requester: Dict[str, Any],
+    requirement: Dict[str, Any],
+    nonce: str,
+    challenged_at: str,
+    expires_at: str,
+) -> str:
+    """Canonical OFFLINE APPROVAL payload (docs/DIV.md §5a.2).
+
+    Byte-identical to ``canonicalOfflineIntentPayload`` in @intyga/verify and @intyga/mcp-schemas,
+    pinned by ``offlineIntentPayloads`` in the committed vectors.
+
+    Deliberately a separate function rather than a ``type`` argument on ``canonical_intent_payload``,
+    so the ordinary approval path cannot accidentally emit an offline payload.
+
+    ``challenged_at`` exists so a verifier can bound the validity WINDOW, not merely the expiry: a
+    payload minted with an over-long ``expires_at`` is otherwise indistinguishable from a correct one.
+    """
+    req, rq = _canonical_common(requester, requirement)
     return stable_stringify(
         {
             "v": DIV_VERSION,
-            "type": DIV_INTENT_TYPE,
+            "type": DIV_OFFLINE_INTENT_TYPE,
             "target": target,
             "actionType": action_type,
             "display": display,
             "params": params,
-            "requester": {"did": requester.get("did", ""), "attestation": attestation},
-            "requirement": {
-                "requiredApprovals": requirement.get("requiredApprovals", 1),
-                "requireHardwareKey": requirement.get("requireHardwareKey", False),
-                "allowedAaguids": sorted(requirement.get("allowedAaguids", [])),
-                "requesterCannotApprove": requirement.get("requesterCannotApprove", False),
-            },
+            "requester": req,
+            "requirement": rq,
             "nonce": nonce,
+            "challengedAt": challenged_at,
             "expiresAt": expires_at,
         }
     )
+
+
+def canonical_delegation_payload(
+    target: str,
+    action_type: str,
+    display: str,
+    params: Dict[str, Any],
+    requester: Dict[str, Any],
+    requirement: Dict[str, Any],
+    delegated_to: list,
+    delegated_quorum: int,
+    nonce: str,
+    sealed_at: str,
+    expires_at: str,
+) -> str:
+    """Canonical DELEGATION payload (docs/DIV.md §5a.5) — a signed statement about WHO MAY APPROVE,
+    not about what may run.
+
+    ``delegated_to`` is sorted because it is a SET, exactly as ``allowedAaguids`` is. ``requirement``
+    describes the quorum that signed this delegation; ``delegated_quorum`` is how many of
+    ``delegated_to`` must sign at incident time. Two different quorums, so both are in the signed bytes.
+    """
+    req, rq = _canonical_common(requester, requirement)
+    return stable_stringify(
+        {
+            "v": DIV_VERSION,
+            "type": DIV_DELEGATION_TYPE,
+            "target": target,
+            "actionType": action_type,
+            "display": display,
+            "params": params,
+            "requester": req,
+            "requirement": rq,
+            "delegatedTo": sorted(delegated_to),
+            "delegatedQuorum": delegated_quorum,
+            "nonce": nonce,
+            "sealedAt": sealed_at,
+            "expiresAt": expires_at,
+        }
+    )
+
 
 def canonical_action_payload(nonce: str, action_type: str, summary: str, params: Dict[str, Any]) -> str:
     """v2 canonical console-action payload."""
@@ -355,6 +472,8 @@ def verify_approval_receipt(
     as_of: "datetime | None" = None,
     clock_skew_seconds: int = DEFAULT_CLOCK_SKEW_SECONDS,
     allow_cross_origin: bool = False,
+    allow_offline: bool = False,
+    delegation: "Dict[str, Any] | None" = None,
 ) -> Dict[str, Any]:
     """
     Independently verify a DIV Proof Envelope. Returns {'ok': True} or {'ok': False, 'reason': ...}.
@@ -377,6 +496,16 @@ def verify_approval_receipt(
     Expiry (DIV §5.8/§6.2) is enforced fail-closed by default; pass allow_expired=True ONLY for
     post-hoc audit re-verification. WEBAUTHN receipts additionally require expected_origin and
     expected_rp_id — without them an assertion harvested at any relying party would verify.
+
+    OFFLINE APPROVALS (DIV §5a.3) are refused unless ``allow_offline=True``, exactly like
+    AUTO_APPROVED ones. Pass it at the SPECIFIC call permitted to run under one, never globally: a
+    process-wide default would make every gated action accept an out-of-band approval. It weakens
+    nothing else — the quorum, four-eyes and target binding are still enforced, the window is capped at
+    MAX_OFFLINE_WINDOW_MINUTES, and a proof whose signed policy demands a hardware key is REFUSED
+    because that cannot be satisfied offline.
+
+    ``delegation`` is a delegation ALREADY verified by :func:`verify_delegation`, substituting the
+    eligible approver set and quorum for this one verification (DIV §5a.6). It narrows, never widens.
     """
     canonical_payload = receipt.get("canonicalPayload", "")
     try:
@@ -391,8 +520,30 @@ def verify_approval_receipt(
     if version != DIV_VERSION:
         shown = version if isinstance(version, int) and version else "unparseable"
         return {"ok": False, "reason": f"unsupported DIV payload version ({shown})"}
-    if payload_data.get("type") != DIV_INTENT_TYPE:
+    payload_type = payload_data.get("type")
+    # A DELEGATION authorizes nothing (DIV §5a.5). Refused here unconditionally — there is deliberately
+    # NO option that would let one through, because a delegation that could authorize its own action
+    # would be exactly the pre-signed bearer capability the design exists to avoid.
+    if payload_type == DIV_DELEGATION_TYPE:
+        return {
+            "ok": False,
+            "reason": "this is a delegation, which authorizes no action on its own — verify it with "
+                      "verify_delegation and pass the result as delegation=, together with an offline "
+                      "approval signed by the delegated operators",
+        }
+    offline = payload_type == DIV_OFFLINE_INTENT_TYPE
+    if not offline and payload_type != DIV_INTENT_TYPE:
         return {"ok": False, "reason": "payload is not a div-intent-verification"}
+    if offline and not allow_offline:
+        return {
+            "ok": False,
+            "reason": "this is an offline approval; pass allow_offline=True at the specific call site "
+                      "permitted to run under one",
+        }
+    # A delegation only ever substitutes the approver set for an OFFLINE proof. Accepting it against an
+    # ordinary gateway-mediated receipt would silently replace the quorum the gateway enforced.
+    if delegation is not None and not offline:
+        return {"ok": False, "reason": "a delegation can only substitute the approver set for an offline approval"}
 
     # Bind the receipt to the challenge the caller is redeeming, before anything else.
     if nonce != expected.get("nonce"):
@@ -419,16 +570,84 @@ def verify_approval_receipt(
     requirement = payload_data.get("requirement")
     if not isinstance(requirement, dict) or not isinstance(requirement.get("requiredApprovals"), int):
         return {"ok": False, "reason": "receipt payload is missing the signed approval requirement"}
-    recomputed = canonical_intent_payload(
-        target=expected.get("target", ""),
-        action_type=expected.get("actionType", ""),
-        display=receipt.get("actionDescription", ""),
-        params=expected.get("params", {}),
-        requester=requester,
-        requirement=requirement,
-        nonce=nonce,
-        expires_at=expires_at,
-    )
+    # Offline proofs carry challengedAt so the validity WINDOW can be bounded here, not merely at mint.
+    challenged_at = ""
+    if offline:
+        challenged_at = payload_data.get("challengedAt")
+        if not isinstance(challenged_at, str) or not challenged_at:
+            return {"ok": False, "reason": "offline proof is missing challengedAt"}
+        challenged = _parse_rfc3339(challenged_at)
+        if challenged is None:
+            return {"ok": False, "reason": "challengedAt is not a valid RFC3339 timestamp"}
+        expiry_probe = _parse_rfc3339(expires_at)
+        if expiry_probe is not None:
+            window_minutes = (expiry_probe.timestamp() - challenged.timestamp()) / 60.0
+            if window_minutes < 0:
+                return {"ok": False, "reason": "offline proof expires before it was challenged"}
+            if window_minutes > MAX_OFFLINE_WINDOW_MINUTES:
+                return {
+                    "ok": False,
+                    "reason": f"offline window is {window_minutes:.1f} minutes, over the "
+                              f"{MAX_OFFLINE_WINDOW_MINUTES}-minute maximum",
+                }
+        # A hardware-key policy CANNOT be satisfied offline (DIV §5a.3 step 4). WebAuthn needs a secure
+        # context and an RP ID an offline signing surface will not match, so an offline witness is
+        # always a bare key. Accepting the proof anyway would silently downgrade the policy the approver
+        # attested to, so it is refused instead — fail closed, and say why.
+        if requirement.get("requireHardwareKey") is True:
+            return {
+                "ok": False,
+                "reason": "the signed policy requires a hardware-backed WebAuthn credential, which "
+                          "cannot be produced offline — this action cannot be approved out of band "
+                          "(DIV §5a.3)",
+            }
+
+    # A delegation substitutes WHO may approve and HOW MANY, and nothing else (DIV §5a.6). Every
+    # agreement check is on the SIGNED bytes of both proofs, so neither can widen the other.
+    delegated_to = None
+    delegated_quorum = None
+    if delegation is not None:
+        if delegation.get("target") != expected.get("target"):
+            return {"ok": False, "reason": "the delegation was issued for a different target"}
+        if delegation.get("actionType") != expected.get("actionType"):
+            return {"ok": False, "reason": "the delegation was issued for a different actionType"}
+        if stable_stringify(delegation.get("params", {})) != stable_stringify(expected.get("params", {})):
+            return {"ok": False, "reason": "the delegation was issued for different params"}
+        # The offline payload's signed quorum must equal the delegated one, so the operators signed the
+        # policy their signatures are being counted toward rather than a different one.
+        if requirement.get("requiredApprovals") != delegation.get("delegatedQuorum"):
+            return {
+                "ok": False,
+                "reason": f"offline proof declares {requirement.get('requiredApprovals')} required "
+                          f"approval(s) but the delegation delegates a quorum of "
+                          f"{delegation.get('delegatedQuorum')}",
+            }
+        delegated_to = list(delegation.get("delegatedTo") or [])
+        delegated_quorum = delegation.get("delegatedQuorum")
+
+    if offline:
+        recomputed = canonical_offline_intent_payload(
+            target=expected.get("target", ""),
+            action_type=expected.get("actionType", ""),
+            display=receipt.get("actionDescription", ""),
+            params=expected.get("params", {}),
+            requester=requester,
+            requirement=requirement,
+            nonce=nonce,
+            challenged_at=challenged_at,
+            expires_at=expires_at,
+        )
+    else:
+        recomputed = canonical_intent_payload(
+            target=expected.get("target", ""),
+            action_type=expected.get("actionType", ""),
+            display=receipt.get("actionDescription", ""),
+            params=expected.get("params", {}),
+            requester=requester,
+            requirement=requirement,
+            nonce=nonce,
+            expires_at=expires_at,
+        )
     if recomputed != canonical_payload:
         return {"ok": False, "reason": "target/params/actionType do not match what was approved"}
 
@@ -449,6 +668,14 @@ def verify_approval_receipt(
             return {"ok": False, "reason": "approval was requested by a different principal"}
 
     sig_alg = receipt.get("sigAlg")
+    if sig_alg == "AUTO_APPROVED" and offline:
+        # An offline approval with no human signature is a contradiction: the entire premise is that
+        # humans signed out of band, so allow_auto_approved must not rescue it.
+        return {
+            "ok": False,
+            "autoApproved": True,
+            "reason": "an offline approval cannot be auto-approved — there is no human signature to verify",
+        }
     if sig_alg == "AUTO_APPROVED":
         if allow_auto_approved:
             return {"ok": True, "autoApproved": True}
@@ -468,7 +695,7 @@ def verify_approval_receipt(
     verified_signers = set()
     failures = []
     for witness in witnesses:
-        candidates, reason = _candidate_keys(approvers, witness)
+        candidates, reason = _candidate_keys(approvers, witness, delegated_to)
         if reason is not None:
             failures.append(reason)
             continue
@@ -501,7 +728,10 @@ def verify_approval_receipt(
             continue
         verified_signers.add(matched)
 
-    required = max(1, int(requirement.get("requiredApprovals", 1)))
+    # Under a delegation the quorum is the DELEGATED one. Already checked to equal the offline payload's
+    # signed requiredApprovals, so this is the same number by a different route — stated explicitly so
+    # the substitution is visible where it takes effect.
+    required = max(1, int(delegated_quorum if delegated_quorum is not None else requirement.get("requiredApprovals", 1)))
     if len(verified_signers) < required:
         detail = f" ({'; '.join(failures)})" if failures else ""
         return {
@@ -509,6 +739,194 @@ def verify_approval_receipt(
             "reason": f"quorum not met: {len(verified_signers)} of {required} required approver signatures verified{detail}",
         }
     return {"ok": True, "signers": sorted(verified_signers)}
+
+
+def verify_delegation(
+    receipt: Dict[str, Any],
+    expected: Dict[str, Any],
+    allow_expired: bool = False,
+    as_of: "datetime | None" = None,
+    clock_skew_seconds: int = DEFAULT_CLOCK_SKEW_SECONDS,
+    expected_origin: str = None,
+    expected_rp_id: str = None,
+    require_user_verification: bool = True,
+    allow_cross_origin: bool = False,
+) -> Dict[str, Any]:
+    """Verify a DELEGATION (docs/DIV.md §5a.6 step 1).
+
+    A delegation is a statement, signed in advance by the ordinary quorum, naming local operators who
+    may approve one pre-declared action while the gateway is unreachable.
+
+    Deliberately a SEPARATE function from :func:`verify_approval_receipt`, which refuses this payload
+    type outright. A delegation authorizes nothing, and the only way to keep that true structurally is
+    to make it impossible to hand one to the approval verifier and get ``ok: True`` back. What you get
+    here is a dict to pass as ``delegation=`` to a later approval check — an input, never a substitute.
+
+    ``expected['approvers']`` MUST be the ORDINARY approver set, not the delegated operators: the point
+    of the check is that the people entitled to approve this action are the ones who signed away that
+    entitlement.
+    """
+    canonical_payload = receipt.get("canonicalPayload", "")
+    try:
+        payload_data = json.loads(canonical_payload)
+    except Exception:
+        return {"ok": False, "reason": "malformed canonicalPayload"}
+    if not isinstance(payload_data, dict):
+        return {"ok": False, "reason": "malformed canonicalPayload"}
+    if payload_data.get("v") != DIV_VERSION:
+        return {"ok": False, "reason": "unsupported DIV payload version"}
+    if payload_data.get("type") != DIV_DELEGATION_TYPE:
+        return {"ok": False, "reason": "payload is not a div-delegation"}
+
+    delegated_to = payload_data.get("delegatedTo")
+    if not isinstance(delegated_to, list) or not delegated_to or not all(
+        isinstance(d, str) and d for d in delegated_to
+    ):
+        return {"ok": False, "reason": "delegation is missing a valid delegatedTo set"}
+    delegated_quorum = payload_data.get("delegatedQuorum")
+    if not isinstance(delegated_quorum, int) or isinstance(delegated_quorum, bool) or delegated_quorum < 1:
+        return {"ok": False, "reason": "delegation is missing a valid delegatedQuorum"}
+    # Deduplicate before the size check: a delegatedTo listing one operator three times would otherwise
+    # appear to support a 3-of-3 quorum that one person could satisfy alone.
+    distinct = list(dict.fromkeys(delegated_to))
+    if len(distinct) < delegated_quorum:
+        return {
+            "ok": False,
+            "reason": f"delegation names {len(distinct)} distinct operator(s) but delegates a quorum of "
+                      f"{delegated_quorum} — it can never be satisfied",
+        }
+
+    sealed_at = payload_data.get("sealedAt")
+    expires_at = payload_data.get("expiresAt")
+    if not isinstance(sealed_at, str) or not sealed_at:
+        return {"ok": False, "reason": "delegation is missing sealedAt"}
+    if not isinstance(expires_at, str) or not expires_at:
+        return {"ok": False, "reason": "delegation is missing expiresAt"}
+    sealed = _parse_rfc3339(sealed_at)
+    expiry = _parse_rfc3339(expires_at)
+    if sealed is None:
+        return {"ok": False, "reason": "sealedAt is not a valid RFC3339 timestamp"}
+    if expiry is None:
+        return {"ok": False, "reason": "expiresAt is not a valid RFC3339 timestamp"}
+    window_hours = (expiry.timestamp() - sealed.timestamp()) / 3600.0
+    if window_hours < 0:
+        return {"ok": False, "reason": "delegation expires before it was sealed"}
+    if window_hours > MAX_DELEGATION_WINDOW_HOURS:
+        return {
+            "ok": False,
+            "reason": f"delegation window is {window_hours:.1f} hours, over the "
+                      f"{MAX_DELEGATION_WINDOW_HOURS}-hour maximum",
+        }
+
+    requester = receipt.get("requester")
+    if not requester:
+        return {"ok": False, "reason": "delegation missing requester"}
+    requirement = payload_data.get("requirement")
+    if not isinstance(requirement, dict) or not isinstance(requirement.get("requiredApprovals"), int):
+        return {"ok": False, "reason": "delegation payload is missing the signed approval requirement"}
+    approvers = expected.get("approvers")
+    if not isinstance(approvers, dict) or not (approvers.get("publicKeys") or approvers.get("dids")):
+        return {
+            "ok": False,
+            "reason": "expected['approvers'] is required — the delegating approvers MUST come from your "
+                      "own trust policy, never from the delegation (DIV Invariant 3)",
+        }
+    if not expected.get("target"):
+        return {
+            "ok": False,
+            "reason": "expected['target'] is required — it must be YOUR target identifier, asserted "
+                      "independently of the delegation (DIV Target Isolation)",
+        }
+
+    nonce = payload_data.get("nonce", "")
+    recomputed = canonical_delegation_payload(
+        target=expected.get("target", ""),
+        action_type=expected.get("actionType", ""),
+        display=receipt.get("actionDescription", ""),
+        params=expected.get("params", {}),
+        requester=requester,
+        requirement=requirement,
+        delegated_to=delegated_to,
+        delegated_quorum=delegated_quorum,
+        nonce=nonce,
+        sealed_at=sealed_at,
+        expires_at=expires_at,
+    )
+    if recomputed != canonical_payload:
+        return {"ok": False, "reason": "target/params/actionType do not match what was delegated"}
+
+    if not allow_expired:
+        now = as_of or datetime.now(timezone.utc)
+        if now.timestamp() > expiry.timestamp() + clock_skew_seconds:
+            return {"ok": False, "reason": "delegation has expired (pass allow_expired=True for audit re-verification)"}
+
+    if receipt.get("sigAlg") == "AUTO_APPROVED":
+        return {
+            "ok": False,
+            "reason": "a delegation cannot be auto-approved — delegating approval authority requires "
+                      "human signatures",
+        }
+
+    witnesses = _witnesses_of(receipt)
+    if not witnesses:
+        return {"ok": False, "reason": "delegation missing signature material"}
+
+    verified_signers = set()
+    failures = []
+    for witness in witnesses:
+        candidates, reason = _candidate_keys(approvers, witness)
+        if reason is not None:
+            failures.append(reason)
+            continue
+        matched = None
+        last_reason = "signature does not verify against any trusted approver key"
+        for key, identity in candidates:
+            ok, why = _verify_witness(
+                witness, key, canonical_payload,
+                expected_origin, expected_rp_id, require_user_verification, allow_cross_origin,
+            )
+            if ok:
+                matched = identity
+                break
+            last_reason = why
+        if matched is None:
+            failures.append(last_reason)
+            continue
+        if requirement.get("requireHardwareKey") is True and witness.get("sigAlg") != "WEBAUTHN":
+            failures.append(
+                f"signer {witness.get('signerDid')} used a bare key, but the signed policy requires "
+                "a hardware-backed WebAuthn credential"
+            )
+            continue
+        if requirement.get("requesterCannotApprove") is True and witness.get("signerDid") == requester.get("did"):
+            failures.append(f"four-eyes: requester {witness.get('signerDid')} cannot delegate to themselves")
+            continue
+        verified_signers.add(matched)
+
+    required = max(1, int(requirement.get("requiredApprovals", 1)))
+    if len(verified_signers) < required:
+        detail = f" ({'; '.join(failures)})" if failures else ""
+        return {
+            "ok": False,
+            "reason": f"delegation quorum not met: {len(verified_signers)} of {required} required "
+                      f"approver signatures verified{detail}",
+        }
+
+    return {
+        "ok": True,
+        "delegation": {
+            # The DEDUPLICATED set: this is what gets enforced against witness DIDs later, and a
+            # duplicate entry must not create the illusion of a larger eligible pool.
+            "delegatedTo": distinct,
+            "delegatedQuorum": delegated_quorum,
+            "target": expected.get("target", ""),
+            "actionType": expected.get("actionType", ""),
+            "params": expected.get("params", {}),
+            "nonce": nonce,
+            "signers": sorted(verified_signers),
+            "expiresAt": expires_at,
+        },
+    }
 
 def _witnesses_of(receipt: Dict[str, Any]) -> list:
     """Normalize a receipt to a witness list: ``signatures`` if present, else the single-sig fields."""
@@ -526,7 +944,7 @@ def _witnesses_of(receipt: Dict[str, Any]) -> list:
         }]
     return []
 
-def _candidate_keys(approvers: Dict[str, Any], witness: Dict[str, Any]):
+def _candidate_keys(approvers: Dict[str, Any], witness: Dict[str, Any], restrict_to=None):
     """
     The keys we will accept this witness under, drawn ENTIRELY from the caller's trust anchor.
 
@@ -536,9 +954,25 @@ def _candidate_keys(approvers: Dict[str, Any], witness: Dict[str, Any]):
     counts distinct APPROVERS. In publicKeys mode the identity is the key itself, because the
     receipt's ``signerDid`` is an unverified string there and counting it would let one approver
     claim to be three.
+
+    ``resolveKey`` may return a LIST of keys for one DID. An approver commonly holds a software key plus
+    one or more registered authenticators, and any of them is legitimately theirs; returning them all
+    keeps the identity intact instead of forcing callers into publicKeys mode and losing the DID
+    binding. Every key returned for a DID counts as that ONE approver.
+
+    ``restrict_to`` narrows eligibility to the identities a delegation names (DIV §5a.6 step 3),
+    applied ON TOP of the trust anchor rather than instead of it.
     """
     public_keys = approvers.get("publicKeys")
     if public_keys is not None:
+        # A delegation names identities, and in publicKeys mode signerDid is an unverified string —
+        # enforcing delegatedTo against it would be security theatre. Refuse rather than pretend.
+        if restrict_to is not None:
+            return None, (
+                "a delegation names approver identities, so it requires a DID-mode trust anchor "
+                "({'dids': [...], 'resolveKey': ...}); in publicKeys mode signerDid is unverified and "
+                "delegatedTo cannot be enforced"
+            )
         if not public_keys:
             return None, "trusted approver allowlist is empty"
         return [(k, k) for k in public_keys], None
@@ -547,12 +981,19 @@ def _candidate_keys(approvers: Dict[str, Any], witness: Dict[str, Any]):
     signer_did = witness.get("signerDid")
     if not signer_did or signer_did not in dids:
         return None, f"signer {signer_did or '(unknown)'} is not an authorized approver"
+    if restrict_to is not None and signer_did not in restrict_to:
+        return None, f"signer {signer_did} is not named in the delegation"
     if not callable(resolve):
         return None, "approvers.dids requires a resolveKey callable"
     resolved = resolve(signer_did)
     if not resolved:
         return None, f"no trusted key could be resolved for {signer_did}"
-    return [(resolved, signer_did)], None
+    keys = resolved if isinstance(resolved, (list, tuple)) else [resolved]
+    # All keys for one DID share that DID as their identity, so quorum still counts one approver.
+    candidates = [(k, signer_did) for k in keys if k]
+    if not candidates:
+        return None, f"no trusted key could be resolved for {signer_did}"
+    return candidates, None
 
 def _verify_witness(
     witness: Dict[str, Any],
