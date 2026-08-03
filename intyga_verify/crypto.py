@@ -1,4 +1,5 @@
 import base64
+import functools
 import hashlib
 import hmac
 import json
@@ -28,6 +29,44 @@ MAX_OFFLINE_WINDOW_MINUTES = 60
 # Hard cap on a delegation's window (DIV §5a.6). Hours, not weeks: a delegation cannot be recalled
 # from a relying party that is offline.
 MAX_DELEGATION_WINDOW_HOURS = 72
+
+#: Upper bound on witnesses in one receipt (mirrors MAX_WITNESSES in @intyga/verify).
+#: Each witness costs an ECDSA verification, and the list is attacker-supplied: 20,000 of them
+#: measured at ~1.5s of CPU and a 1.16 MB failure string, per request, from a JSON body. A real
+#: quorum is single digits.
+MAX_WITNESSES = 64
+
+#: Failure reasons reported before truncating. An unbounded join over the witness list was itself
+#: the memory half of the amplification.
+MAX_REPORTED_FAILURES = 8
+
+
+def _never_raises(fn):
+    """Turn any escape from a verifier into a refusal.
+
+    These functions are documented as returning {'ok': False, 'reason': ...}, and callers rely on
+    that: an uncaught exception is not "invalid", it is a crash, and any caller that treats a
+    traceback as anything other than a refusal fails open. Hostile receipts reached AttributeError,
+    TypeError and RecursionError at several sites BEFORE any byte comparison — i.e.
+    pre-authentication — because `requester` and `requirement` are read straight out of
+    attacker-controlled JSON.
+
+    The generic branch reports only the exception TYPE. Python prints locals in traceback frames, and
+    those frames hold key material here; the type name is enough to debug with and carries nothing.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except NonCanonicalValue as exc:
+            return {"ok": False, "reason": f"not canonicalizable: {exc}"}
+        except RecursionError:
+            return {"ok": False, "reason": "input is nested too deeply to canonicalize"}
+        except Exception as exc:  # noqa: BLE001 - a verifier must not propagate
+            return {"ok": False, "reason": f"malformed input ({type(exc).__name__})"}
+
+    return wrapper
 # RECOMMENDED expiry tolerance in seconds (DIV §6.2).
 DEFAULT_CLOCK_SKEW_SECONDS = 30
 
@@ -55,6 +94,60 @@ def base64_decode_flexible(s: str) -> bytes:
     s += "=" * ((4 - len(s) % 4) % 4)
     return base64.b64decode(s)
 
+class NonCanonicalValue(ValueError):
+    """A value that cannot be canonicalized identically across every DIV port.
+
+    Raised rather than coerced. `stable_stringify` used to fall through to `return "null"` for
+    anything `json.dumps` refused, which silently collapsed distinct parameter sets to identical
+    signed bytes: `Decimal("1.00")` and `Decimal("9999999.00")` both became `null`, so a relying
+    party recomputing the payload accepted a receipt a human had approved for a different amount.
+    Decimal and datetime are the idiomatic Python types for exactly the values an approval exists to
+    bind, which is what made this reachable rather than theoretical.
+
+    Callers verify with `expected` they own, so failing loudly here surfaces as a refusal, never as
+    an accidental match. Mirrors `NonCanonicalValue` in @intyga/verify.
+    """
+
+
+def _check_portable_number(value: float) -> None:
+    """Reject numbers whose JSON text differs between ports (DIV §4.1).
+
+    Mirrors `isPortableNumber` in mcp-schemas: outside this range Python's repr and JavaScript's
+    Number#toString diverge (`1e21` vs `1000000000000000000000`, `1e-7` vs `1e-07`), so the two
+    would sign different bytes for the same value. A TS producer refuses these, and a Python signer
+    that accepted them would mint bytes no other port could reproduce.
+    """
+    if isinstance(value, bool):
+        return
+    if math.isnan(value) or math.isinf(value):
+        raise NonCanonicalValue(f"{value!r} has no portable JSON representation")
+    if isinstance(value, float) and value == 0.0 and math.copysign(1.0, value) < 0:
+        raise NonCanonicalValue("-0 is not portable: JS serializes it as 0")
+    magnitude = abs(value)
+    if magnitude != 0 and (magnitude >= 1e16 or magnitude < 1e-4):
+        raise NonCanonicalValue(
+            f"{value!r} is outside the portable range (1e-4 .. 1e16); JS and Python disagree on its JSON text"
+        )
+
+
+def format_jcs_number(value: "int | float") -> str:
+    """The JSON number text JS ``JSON.stringify`` would emit, for values in the portable range.
+
+    Whole-valued floats fold to integer text (JS has ONE number type, so ``100.0`` IS ``100`` and
+    serializes as ``"100"``); everything else takes Python's shortest-round-trip repr via
+    ``json.dumps``, which agrees with JS inside the portable range (1e-4 <= |x| < 1e16).
+
+    Callers that must GUARANTEE cross-port bytes call ``_check_portable_number`` first —
+    ``stable_stringify`` does, because a signer must refuse rather than mint bytes no other port
+    can reproduce. The ledger's ``_jcs`` deliberately does NOT: a verifier recomputing a leaf must
+    fail-to-match on out-of-range input, never crash. Outside the portable range this text can
+    diverge from JS (``1e-05`` vs ``0.00001``) — that divergence is the check's whole point.
+    """
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return json.dumps(value)
+
+
 def stable_stringify(value: Any) -> str:
     """Deterministic JSON stringification with UTF-16 code unit sorted keys."""
     if value is None:
@@ -62,12 +155,8 @@ def stable_stringify(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):
-        if isinstance(value, float):
-            if math.isnan(value) or math.isinf(value):
-                return "null"
-            if value.is_integer():
-                return str(int(value))
-        return json.dumps(value)
+        _check_portable_number(value)
+        return format_jcs_number(value)
     if isinstance(value, str):
         return json.dumps(value, ensure_ascii=False)
     if isinstance(value, (list, tuple)):
@@ -80,68 +169,18 @@ def stable_stringify(value: Any) -> str:
             v_str = stable_stringify(value[k])
             parts.append(f"{k_str}:{v_str}")
         return "{" + ",".join(parts) + "}"
-    try:
-        return json.dumps(value, ensure_ascii=False)
-    except Exception:
-        return "null"
+    # Anything left is not JSON, and guessing at it is how two different amounts became the same
+    # signed bytes. Decimal, datetime, set, bytes and class instances all land here.
+    raise NonCanonicalValue(
+        f"{type(value).__name__} cannot be canonicalized; convert it to a JSON type "
+        f"(str/int/float/bool/None/list/dict) before signing or verifying"
+    )
 
 def canonical_challenge_payload(nonce: str, action_description: str) -> str:
     """v1 canonical challenge payload (flat JSON, no nested sorting)."""
     nonce_json = json.dumps(nonce, ensure_ascii=False)
     action_json = json.dumps(action_description, ensure_ascii=False)
     return f'{{"v":1,"nonce":{nonce_json},"action":{action_json}}}'
-
-def canonical_authorization_payload(nonce: str, action_type: str, action_description: str, params: Dict[str, Any]) -> str:
-    """v2 canonical authorization payload (recursively sorted params)."""
-    nonce_json = json.dumps(nonce, ensure_ascii=False)
-    action_type_json = json.dumps(action_type, ensure_ascii=False)
-    action_json = json.dumps(action_description, ensure_ascii=False)
-    params_json = stable_stringify(params)
-    return (
-        f'{{"v":2,"type":"agent-authorization","nonce":{nonce_json},'
-        f'"actionType":{action_type_json},"action":{action_json},'
-        f'"params":{params_json}}}'
-    )
-
-def canonical_authorization_payload_v3(
-    nonce: str,
-    action_type: str,
-    action_description: str,
-    params: Dict[str, Any],
-    requester: Dict[str, Any],
-    expires_at: str | None = None,
-) -> str:
-    """v3 canonical authorization payload — v2 plus WHO REQUESTED the action.
-
-    Byte-identical to ``canonicalAuthorizationPayloadV3`` in @intyga/mcp-schemas and
-    @intyga/verify. ``requester`` is ``{"did": str, "attestation": {"method","issuer","subject"}
-    | None}``. The requester block is hand-concatenated with a FIXED key order (``did`` then
-    ``attestation``; and within an attestation, ``method``, ``issuer``, ``subject``) — it deliberately
-    does NOT go through ``stable_stringify``, because key order is part of the signed contract. When the
-    requester is unattested the attestation is the literal ``null`` — that null is load-bearing and is
-    signed (it distinguishes "an attested workload asked" from "something holding an API key asked").
-    """
-    nonce_json = json.dumps(nonce, ensure_ascii=False)
-    action_type_json = json.dumps(action_type, ensure_ascii=False)
-    action_json = json.dumps(action_description, ensure_ascii=False)
-    params_json = stable_stringify(params)
-    did_json = json.dumps(requester.get("did", ""), ensure_ascii=False)
-    attestation_val = requester.get("attestation")
-    if attestation_val is None:
-        attestation = "null"
-    else:
-        method_json = json.dumps(attestation_val.get("method", ""), ensure_ascii=False)
-        issuer_json = json.dumps(attestation_val.get("issuer", ""), ensure_ascii=False)
-        subject_json = json.dumps(attestation_val.get("subject", ""), ensure_ascii=False)
-        attestation = f'{{"method":{method_json},"issuer":{issuer_json},"subject":{subject_json}}}'
-    expires_suffix = f',"expiresAt":{json.dumps(expires_at, ensure_ascii=False)}' if expires_at else ""
-    return (
-        f'{{"v":3,"type":"agent-authorization","nonce":{nonce_json},'
-        f'"actionType":{action_type_json},"action":{action_json},'
-        f'"params":{params_json},'
-        f'"requester":{{"did":{did_json},"attestation":{attestation}}}'
-        f'{expires_suffix}}}'
-    )
 
 def canonical_intent_payload(
     target: str,
@@ -209,7 +248,13 @@ def _canonical_common(
         {
             "requiredApprovals": requirement.get("requiredApprovals", 1),
             "requireHardwareKey": requirement.get("requireHardwareKey", False),
-            "allowedAaguids": sorted(requirement.get("allowedAaguids", [])),
+            # UTF-16 code units, not Python's native code-point order — the same key the object keys
+            # use (line ~165). They differ only for non-BMP characters, which no AAGUID (hex UUID) or
+            # DID carries today, but a set sorted one way here and another in the TS reference
+            # produces different SIGNED BYTES, caught by nothing until a receipt fails. DIV §4.3.3.
+            "allowedAaguids": sorted(
+                requirement.get("allowedAaguids", []), key=lambda a: a.encode("utf-16-be")
+            ),
             "requesterCannotApprove": requirement.get("requesterCannotApprove", False),
         },
     )
@@ -286,7 +331,7 @@ def canonical_delegation_payload(
             "params": params,
             "requester": req,
             "requirement": rq,
-            "delegatedTo": sorted(delegated_to),
+            "delegatedTo": sorted(delegated_to, key=lambda d: d.encode("utf-16-be")),
             "delegatedQuorum": delegated_quorum,
             "nonce": nonce,
             "sealedAt": sealed_at,
@@ -461,6 +506,7 @@ def _parse_rfc3339(ts: str):
     except Exception:
         return None
 
+@_never_raises
 def verify_approval_receipt(
     receipt: Dict[str, Any],
     expected: Dict[str, Any],
@@ -579,17 +625,32 @@ def verify_approval_receipt(
         challenged = _parse_rfc3339(challenged_at)
         if challenged is None:
             return {"ok": False, "reason": "challengedAt is not a valid RFC3339 timestamp"}
+        # An unparseable expiresAt must be refused HERE rather than skipping the window cap and
+        # relying on the expiry check further down — that check is disabled by allow_expired, so the
+        # allow_offline + allow_expired combination (the documented forensic re-verification mode,
+        # and the only mode under which an offline proof is examined at all) left the cap unenforced
+        # on a proof whose window could not be computed at all.
+        #
+        # expiresAt is inside the signed bytes, but an offline proof is minted by whoever constructs
+        # it and the verifier reconstructs the payload from the receipt's OWN expiresAt, so any
+        # string round-trips. Measured before this fix: the ES5 extended-year form
+        # "+002036-01-01T00:00:00.000Z" — which Date.parse accepts and datetime.fromisoformat does
+        # not — passed a 10-year window against a 60-minute cap. DIV §5a.3 makes the window the
+        # entire revocation story for an offline proof (an offline relying party has no channel to
+        # recall one), so an unbounded window turns a 60-minute incident credential into a permanent
+        # bearer capability.
         expiry_probe = _parse_rfc3339(expires_at)
-        if expiry_probe is not None:
-            window_minutes = (expiry_probe.timestamp() - challenged.timestamp()) / 60.0
-            if window_minutes < 0:
-                return {"ok": False, "reason": "offline proof expires before it was challenged"}
-            if window_minutes > MAX_OFFLINE_WINDOW_MINUTES:
-                return {
-                    "ok": False,
-                    "reason": f"offline window is {window_minutes:.1f} minutes, over the "
-                              f"{MAX_OFFLINE_WINDOW_MINUTES}-minute maximum",
-                }
+        if expiry_probe is None:
+            return {"ok": False, "reason": "expiresAt is not a valid RFC3339 timestamp"}
+        window_minutes = (expiry_probe.timestamp() - challenged.timestamp()) / 60.0
+        if window_minutes < 0:
+            return {"ok": False, "reason": "offline proof expires before it was challenged"}
+        if window_minutes > MAX_OFFLINE_WINDOW_MINUTES:
+            return {
+                "ok": False,
+                "reason": f"offline window is {window_minutes:.1f} minutes, over the "
+                          f"{MAX_OFFLINE_WINDOW_MINUTES}-minute maximum",
+            }
         # A hardware-key policy CANNOT be satisfied offline (DIV §5a.3 step 4). WebAuthn needs a secure
         # context and an RP ID an offline signing surface will not match, so an offline witness is
         # always a bare key. Accepting the proof anyway would silently downgrade the policy the approver
@@ -689,6 +750,12 @@ def verify_approval_receipt(
     witnesses = _witnesses_of(receipt)
     if not witnesses:
         return {"ok": False, "reason": "receipt missing signature material"}
+    if len(witnesses) > MAX_WITNESSES:
+        # Refuse before spending an ECDSA verification per entry. A genuine quorum is single digits.
+        return {
+            "ok": False,
+            "reason": f"receipt carries {len(witnesses)} witnesses, above the maximum of {MAX_WITNESSES}",
+        }
 
     # Count DISTINCT approvers whose signature verifies under a key we independently trust. Distinct
     # is load-bearing: without it, N copies of one approver's signature would satisfy an N-of-M quorum.
@@ -733,7 +800,10 @@ def verify_approval_receipt(
     # the substitution is visible where it takes effect.
     required = max(1, int(delegated_quorum if delegated_quorum is not None else requirement.get("requiredApprovals", 1)))
     if len(verified_signers) < required:
-        detail = f" ({'; '.join(failures)})" if failures else ""
+        shown = failures[:MAX_REPORTED_FAILURES]
+        if len(failures) > MAX_REPORTED_FAILURES:
+            shown = shown + [f"+{len(failures) - MAX_REPORTED_FAILURES} more"]
+        detail = f" ({'; '.join(shown)})" if shown else ""
         return {
             "ok": False,
             "reason": f"quorum not met: {len(verified_signers)} of {required} required approver signatures verified{detail}",
@@ -741,6 +811,7 @@ def verify_approval_receipt(
     return {"ok": True, "signers": sorted(verified_signers)}
 
 
+@_never_raises
 def verify_delegation(
     receipt: Dict[str, Any],
     expected: Dict[str, Any],
@@ -870,6 +941,12 @@ def verify_delegation(
     witnesses = _witnesses_of(receipt)
     if not witnesses:
         return {"ok": False, "reason": "delegation missing signature material"}
+    if len(witnesses) > MAX_WITNESSES:
+        # Refuse before spending an ECDSA verification per entry. A genuine quorum is single digits.
+        return {
+            "ok": False,
+            "reason": f"delegation carries {len(witnesses)} witnesses, above the maximum of {MAX_WITNESSES}",
+        }
 
     verified_signers = set()
     failures = []
@@ -905,7 +982,10 @@ def verify_delegation(
 
     required = max(1, int(requirement.get("requiredApprovals", 1)))
     if len(verified_signers) < required:
-        detail = f" ({'; '.join(failures)})" if failures else ""
+        shown = failures[:MAX_REPORTED_FAILURES]
+        if len(failures) > MAX_REPORTED_FAILURES:
+            shown = shown + [f"+{len(failures) - MAX_REPORTED_FAILURES} more"]
+        detail = f" ({'; '.join(shown)})" if shown else ""
         return {
             "ok": False,
             "reason": f"delegation quorum not met: {len(verified_signers)} of {required} required "

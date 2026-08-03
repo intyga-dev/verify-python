@@ -34,6 +34,9 @@ class TestVerify(unittest.TestCase):
                     display=inp["actionDescription"],
                     params=inp["params"],
                     requester=inp["requester"],
+                    # REQUIRED and signed (DIV §4.3.2): without it a 3-of-3 hardware-pinned receipt
+                    # would be byte-identical to a 1-of-1 one.
+                    requirement=inp["requirement"],
                     nonce=inp["nonce"],
                     expires_at=inp["expiresAt"],
                 )
@@ -43,11 +46,17 @@ class TestVerify(unittest.TestCase):
         for entry in self.vectors.get("receipts", []):
             receipt = entry["receipt"]
             nonce = json.loads(receipt["canonicalPayload"]).get("nonce")
+            # The approver trust anchor is REQUIRED (DIV Invariant 3): the key must come from the
+            # caller's own policy, never from the receipt. For a golden vector the committed file IS
+            # the enrollment record, so pinning its key is the legitimate resolution step.
             expected = {
                 "target": receipt.get("target"),
                 "actionType": receipt.get("actionType"),
                 "params": receipt.get("params"),
                 "nonce": nonce,
+                "approvers": {"publicKeys": [receipt.get("signerPublicKey")]}
+                if receipt.get("signerPublicKey")
+                else {"publicKeys": ["unused-for-auto-approved"]},
             }
             with self.subTest(name=entry["name"]):
                 result = intyga_verify.verify_approval_receipt(receipt, expected)
@@ -56,7 +65,13 @@ class TestVerify(unittest.TestCase):
     def test_webauthn_vector(self):
         r = self.webauthn["receipt"]
         e = self.webauthn["expected"]
-        expected = {"target": e["target"], "actionType": e["actionType"], "params": e["params"], "nonce": e["nonce"]}
+        expected = {
+            "target": e["target"],
+            "actionType": e["actionType"],
+            "params": e["params"],
+            "nonce": e["nonce"],
+            "approvers": {"publicKeys": [r["signerPublicKey"]]},
+        }
 
         ok = intyga_verify.verify_approval_receipt(
             r, expected, expected_origin=self.webauthn["origin"], expected_rp_id=self.webauthn["rpId"]

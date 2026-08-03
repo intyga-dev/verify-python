@@ -1,11 +1,12 @@
 {
-  "generated": "2026-07-24T19:49:53.154Z",
-  "note": "Cross-language DEWP ledger vectors (docs/DEWP.md). Consumed by the Go/Rust/Python ledger verifiers. Regenerate ONLY on a deliberate format change.",
+  "generated": "2026-08-02T11:11:07.862Z",
+  "note": "Cross-language DEWP ledger vectors (docs/DEWP.md). Consumed by ALL FOUR ledger verifiers: TS (@intyga/verify), Go, Rust, and Python. Regenerate ONLY on a deliberate format change.",
   "domainTags": {
     "leaf": "0x00",
     "node": "0x01",
     "empty": "0x02",
-    "anchor": "0x03"
+    "anchor": "0x03",
+    "chain": "0x04"
   },
   "hashLeaf": [
     {
@@ -118,6 +119,71 @@
       },
       "canonical": "[\"5\",\"2026-07-24T12:00:00.000Z\",\"ACTION_APPROVED\",\"SUCCESS\",\"event 5\",\"{\\\"i\\\":5,\\\"target\\\":\\\"users\\\"}\",null,null,null,null,null,false,\"tenant-1\",\"node-a\",null,null,null,\"6\"]",
       "leafHash": "a890e1065f49956b1e048f3939f9ec3adb39d3b611a965cb6e4ca7ab88987047"
+    },
+    {
+      "name": "metadata-utf16-key-order",
+      "row": {
+        "seq": "9",
+        "tenantSeq": "10",
+        "createdAt": "2026-07-24T12:00:00.000Z",
+        "event": "ACTION_APPROVED",
+        "outcome": "SUCCESS",
+        "detail": "event 9",
+        "metadata": {
+          "�": "replacement",
+          "😀": "emoji",
+          "z": {
+            "b": 2,
+            "a": 1
+          },
+          "i": 3
+        },
+        "signerDid": null,
+        "signerPublicKey": null,
+        "signedPayload": null,
+        "signature": null,
+        "sigAlg": null,
+        "isBillable": false,
+        "tenantId": "tenant-1",
+        "actorNodeId": "node-a",
+        "subjectNodeId": null,
+        "edgeId": null,
+        "challengeId": null
+      },
+      "canonical": "[\"9\",\"2026-07-24T12:00:00.000Z\",\"ACTION_APPROVED\",\"SUCCESS\",\"event 9\",\"{\\\"i\\\":3,\\\"z\\\":{\\\"a\\\":1,\\\"b\\\":2},\\\"😀\\\":\\\"emoji\\\",\\\"�\\\":\\\"replacement\\\"}\",null,null,null,null,null,false,\"tenant-1\",\"node-a\",null,null,null,\"10\"]",
+      "leafHash": "15d4bb905671537428cc5c4cc10ac82373db671d1ff07968fb4297ad4c7f4d45"
+    },
+    {
+      "name": "metadata-portable-number-bounds",
+      "row": {
+        "seq": "7",
+        "tenantSeq": "8",
+        "createdAt": "2026-07-24T12:00:00.000Z",
+        "event": "ACTION_APPROVED",
+        "outcome": "SUCCESS",
+        "detail": "event 7",
+        "metadata": {
+          "safeInt": 9007199254740991,
+          "negSafeInt": -9007199254740991,
+          "e15": 1000000000000000,
+          "smallFloat": 0.0001,
+          "wholeFloat": 100,
+          "zero": 0
+        },
+        "signerDid": null,
+        "signerPublicKey": null,
+        "signedPayload": null,
+        "signature": null,
+        "sigAlg": null,
+        "isBillable": false,
+        "tenantId": "tenant-1",
+        "actorNodeId": "node-a",
+        "subjectNodeId": null,
+        "edgeId": null,
+        "challengeId": null
+      },
+      "canonical": "[\"7\",\"2026-07-24T12:00:00.000Z\",\"ACTION_APPROVED\",\"SUCCESS\",\"event 7\",\"{\\\"e15\\\":1000000000000000,\\\"negSafeInt\\\":-9007199254740991,\\\"safeInt\\\":9007199254740991,\\\"smallFloat\\\":0.0001,\\\"wholeFloat\\\":100,\\\"zero\\\":0}\",null,null,null,null,null,false,\"tenant-1\",\"node-a\",null,null,null,\"8\"]",
+      "leafHash": "e63504dc8a3ebc9006cd2eab64c0d3979040fa57afc275975e0432abe72f7bb8"
     }
   ],
   "inclusion": {
@@ -157,14 +223,83 @@
         "siblingPosition": "RIGHT"
       }
     ],
+    "leafIndex": 1,
+    "blockLeafCount": 3,
     "checkpointProof": [
       {
         "siblingHash": "5c02cdd1d95f9039baacfa783c813ca1e8d09d67dc314b80b00bf075adf2df9b",
         "siblingPosition": "LEFT"
       }
     ],
+    "checkpointLeafIndex": 1,
+    "checkpointLeafCount": 2,
     "dailyRoot": "21d6a7e816839f55b1c146ec0ed6f0aa8693ef6aa09c42ace808f2c999711b53"
   },
+  "inclusionNegative": [
+    {
+      "name": "padding-forgery-index-out-of-range",
+      "reason": "0 <= index < leafCount (DEWP §11.1 check 1)",
+      "leaf": "b563a5e69628743929eddec0ccfeb0745c39577e12a72e84915edd6633cb97f2",
+      "proof": [
+        {
+          "siblingHash": "b563a5e69628743929eddec0ccfeb0745c39577e12a72e84915edd6633cb97f2",
+          "siblingPosition": "LEFT"
+        },
+        {
+          "siblingHash": "ed692f01f7f6c46930d7ad8f9adad3f9f38b7379cf6a8d2f399a0ba1e914fe25",
+          "siblingPosition": "LEFT"
+        }
+      ],
+      "root": "9725a8cf4154eb2b9fc5722dc2e65536eb09eba37150859f97132466815de2ae",
+      "bounds": {
+        "index": 3,
+        "leafCount": 3
+      },
+      "expected": false
+    },
+    {
+      "name": "padding-forgery-inflated-leaf-count",
+      "reason": "leafCount arrives inside the proof, so inflating it to 4 makes index 3 in-range AND the path length correct. Only the self-pairing rule rejects it: a node hashed against itself away from the unpaired end of an odd level is the signature of an index pointing into padding (DEWP §11.1 check 3)",
+      "leaf": "b563a5e69628743929eddec0ccfeb0745c39577e12a72e84915edd6633cb97f2",
+      "proof": [
+        {
+          "siblingHash": "b563a5e69628743929eddec0ccfeb0745c39577e12a72e84915edd6633cb97f2",
+          "siblingPosition": "LEFT"
+        },
+        {
+          "siblingHash": "ed692f01f7f6c46930d7ad8f9adad3f9f38b7379cf6a8d2f399a0ba1e914fe25",
+          "siblingPosition": "LEFT"
+        }
+      ],
+      "root": "9725a8cf4154eb2b9fc5722dc2e65536eb09eba37150859f97132466815de2ae",
+      "bounds": {
+        "index": 3,
+        "leafCount": 4
+      },
+      "expected": false
+    },
+    {
+      "name": "honest-unpaired-tail-still-verifies",
+      "reason": "index 2 of 3 IS the unpaired end, so self-pairing is legitimate there",
+      "leaf": "b563a5e69628743929eddec0ccfeb0745c39577e12a72e84915edd6633cb97f2",
+      "proof": [
+        {
+          "siblingHash": "b563a5e69628743929eddec0ccfeb0745c39577e12a72e84915edd6633cb97f2",
+          "siblingPosition": "RIGHT"
+        },
+        {
+          "siblingHash": "ed692f01f7f6c46930d7ad8f9adad3f9f38b7379cf6a8d2f399a0ba1e914fe25",
+          "siblingPosition": "LEFT"
+        }
+      ],
+      "root": "9725a8cf4154eb2b9fc5722dc2e65536eb09eba37150859f97132466815de2ae",
+      "bounds": {
+        "index": 2,
+        "leafCount": 3
+      },
+      "expected": true
+    }
+  ],
   "anchor": {
     "input": {
       "dailyRoot": "21d6a7e816839f55b1c146ec0ed6f0aa8693ef6aa09c42ace808f2c999711b53",
@@ -173,5 +308,51 @@
       "algorithm": "ES256"
     },
     "digestHex": "4da6282473396aec2e8ffdcbc56ff2cc627e80e206262ed148c9ce6bba24aa7b"
+  },
+  "signedAnchor": {
+    "signerKey": {
+      "spkiB64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEcgDU9gGDb54uAiPyVM2he6jILLh42AIaVsu8J0+wWJE7Yq3MYvH6+ILxNKGapwxUptfe1gex4Eg9HxAmJxqvfw==",
+      "pkcs8B64": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgyrRBrbupK9mBekINS3vT8srQUXh4Qq7Q9d+LvjDoRaihRANCAARyANT2AYNvni4CI/JUzaF7qMgsuHjYAhpWy7wnT7BYkTtircxi8fr4gvE0oZqnDFSm197WB7HgSD0fECYnGq9/"
+    },
+    "cases": [
+      {
+        "name": "es256-over-raw-digest-verifies",
+        "anchor": {
+          "dailyRoot": "21d6a7e816839f55b1c146ec0ed6f0aa8693ef6aa09c42ace808f2c999711b53",
+          "timestamp": "2026-07-24T23:59:00.000Z",
+          "issuer": "https://transparency.example.org",
+          "algorithm": "ES256",
+          "keyId": "vector-anchor-key-1",
+          "signature": "MEUCIAdZDHgpSUNzvR08Bb9OPgNdsWVCJrUrP+/c5wjOi/ZCAiEA516sJRZWiK6noU8pkXecKK+ouv9SYF9U8cL/o6Xb8+E="
+        },
+        "digestHex": "4da6282473396aec2e8ffdcbc56ff2cc627e80e206262ed148c9ce6bba24aa7b",
+        "expectOk": true
+      },
+      {
+        "name": "es256-raw-p1363-anchor-signature-verifies",
+        "anchor": {
+          "dailyRoot": "21d6a7e816839f55b1c146ec0ed6f0aa8693ef6aa09c42ace808f2c999711b53",
+          "timestamp": "2026-07-24T23:59:00.000Z",
+          "issuer": "https://transparency.example.org",
+          "algorithm": "ES256",
+          "keyId": "vector-anchor-key-1",
+          "signature": "ObQsIPX5RCayGdl5vElLtBZ/b8zkhRA/ABuXIOoRYd9NbnVAXaZ9kI7ipUTqPf5Uhw13x92ulWsjtynqoWuAUA=="
+        },
+        "digestHex": "4da6282473396aec2e8ffdcbc56ff2cc627e80e206262ed148c9ce6bba24aa7b",
+        "expectOk": true
+      },
+      {
+        "name": "same-signature-different-root-fails",
+        "anchor": {
+          "dailyRoot": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "timestamp": "2026-07-24T23:59:00.000Z",
+          "issuer": "https://transparency.example.org",
+          "algorithm": "ES256",
+          "keyId": "vector-anchor-key-1",
+          "signature": "MEUCIAdZDHgpSUNzvR08Bb9OPgNdsWVCJrUrP+/c5wjOi/ZCAiEA516sJRZWiK6noU8pkXecKK+ouv9SYF9U8cL/o6Xb8+E="
+        },
+        "expectOk": false
+      }
+    ]
   }
 }
