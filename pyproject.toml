@@ -5,11 +5,19 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "intyga-verify"
 version = "0.1.0"
-description = "Zero-config offline verifier for Intyga approval receipts"
+description = "Offline verifier for Intyga approval receipts — no Intyga secret, no network"
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Intyga" }]
+keywords = ["verification", "receipts", "webauthn", "es256", "audit", "offline"]
 requires-python = ">=3.10"
 dependencies = ["cryptography>=40.0.0"]
+
+[project.urls]
+Homepage = "https://www.intyga.com"
+Repository = "https://github.com/intyga-dev/verify-python"
+Issues = "https://github.com/intyga-dev/verify-python/issues"
 
 [tool.setuptools]
 packages = ["intyga_verify"]
