@@ -256,6 +256,10 @@ def _canonical_common(
                 requirement.get("allowedAaguids", []), key=lambda a: a.encode("utf-16-be")
             ),
             "requesterCannotApprove": requirement.get("requesterCannotApprove", False),
+            # The required signer CLASS (DIV §4.3.2) — "human" is the only value defined today.
+            # Defaulted to "" (never "human") so a caller that forgot the field produces bytes no
+            # verifier accepts, rather than silently minting a human-class attestation.
+            "signerClass": requirement.get("signerClass", ""),
         },
     )
 
@@ -506,6 +510,29 @@ def _parse_rfc3339(ts: str):
     except Exception:
         return None
 
+
+#: The signer classes this verifier can reason about (DIV §4.3.2). "human" is the only class
+#: defined today.
+KNOWN_SIGNER_CLASSES = frozenset({"human"})
+
+
+def _signer_class_problem(requirement: Dict[str, Any]) -> "str | None":
+    """Validate ``requirement.signerClass`` out of the signed bytes (DIV §4.3.2).
+
+    FAIL CLOSED both ways: an absent class predates (or dropped) the field, and an unrecognized
+    class must never verify as if it were human-approved — that is the entire point of putting the
+    class in the signed bytes.
+    """
+    signer_class = requirement.get("signerClass")
+    if not isinstance(signer_class, str) or not signer_class:
+        return "the signed requirement is missing signerClass (DIV §4.3.2)"
+    if signer_class not in KNOWN_SIGNER_CLASSES:
+        return (
+            f'the signed requirement declares signerClass "{signer_class}", which this verifier '
+            "does not recognize — refusing rather than treating it as human-approved (DIV §4.3.2)"
+        )
+    return None
+
 @_never_raises
 def verify_approval_receipt(
     receipt: Dict[str, Any],
@@ -616,6 +643,9 @@ def verify_approval_receipt(
     requirement = payload_data.get("requirement")
     if not isinstance(requirement, dict) or not isinstance(requirement.get("requiredApprovals"), int):
         return {"ok": False, "reason": "receipt payload is missing the signed approval requirement"}
+    signer_class_problem = _signer_class_problem(requirement)
+    if signer_class_problem:
+        return {"ok": False, "reason": signer_class_problem}
     # Offline proofs carry challengedAt so the validity WINDOW can be bounded here, not merely at mint.
     challenged_at = ""
     if offline:
@@ -895,6 +925,9 @@ def verify_delegation(
     requirement = payload_data.get("requirement")
     if not isinstance(requirement, dict) or not isinstance(requirement.get("requiredApprovals"), int):
         return {"ok": False, "reason": "delegation payload is missing the signed approval requirement"}
+    signer_class_problem = _signer_class_problem(requirement)
+    if signer_class_problem:
+        return {"ok": False, "reason": signer_class_problem}
     approvers = expected.get("approvers")
     if not isinstance(approvers, dict) or not (approvers.get("publicKeys") or approvers.get("dids")):
         return {
