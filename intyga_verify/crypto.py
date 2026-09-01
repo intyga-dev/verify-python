@@ -119,7 +119,11 @@ def _check_portable_number(value: float) -> None:
     """
     if isinstance(value, bool):
         return
-    if math.isnan(value) or math.isinf(value):
+    # NaN/Inf are float-only states, and the test must not be applied to an int: ``math.isnan`` first
+    # converts to double, so an arbitrary-precision int above the double range raised OverflowError
+    # out of the public signing APIs instead of the documented NonCanonicalValue refusal. The
+    # magnitude comparison below is exact for any int, so it catches those without a conversion.
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
         raise NonCanonicalValue(f"{value!r} has no portable JSON representation")
     if isinstance(value, float) and value == 0.0 and math.copysign(1.0, value) < 0:
         raise NonCanonicalValue("-0 is not portable: JS serializes it as 0")
@@ -533,6 +537,45 @@ def _signer_class_problem(requirement: Dict[str, Any]) -> "str | None":
         )
     return None
 
+
+INVALID_QUORUM_REASON = (
+    "signed requirement.requiredApprovals must be an integer of at least 1 (DIV §4.3.2)"
+)
+
+
+def _quorum_problem(requirement: Dict[str, Any]) -> "str | None":
+    """Enforce DIV §4.3.2: ``requiredApprovals`` is an integer ≥ 1.
+
+    Stated as its own refusal rather than clamped, because §5 step 7 rejects unless the counted
+    identities are AT LEAST this number — 0 is satisfied by counting nothing, so an unenforced
+    minimum would attest an envelope carrying no valid witness signature. ``bool`` is excluded
+    deliberately: in Python ``True`` is an ``int``, and a quorum of ``True`` is not a quorum of 1.
+    """
+    required = requirement.get("requiredApprovals")
+    if not isinstance(required, int) or isinstance(required, bool) or required < 1:
+        return INVALID_QUORUM_REASON
+    return None
+
+
+def _binding_fields_problem(expected: Dict[str, Any], artifact: str) -> "str | None":
+    """Require the caller to state ``actionType`` and ``params`` (DIV §4.4.1).
+
+    Together with ``target`` these are the security-binding fields, which "MUST come exclusively
+    from the Relying Party's own runtime during reconstruction". Defaulting an ABSENT key to
+    ``""``/``{}`` — which this did — rebuilt a payload bound to nothing, so a receipt minted with
+    those same empty values verified against an expectation that never named the action. The TS
+    reference cannot reach that state: ``stableStringify(undefined)`` throws and the rebuild is
+    refused. An explicitly written ``""``/``{}`` is still accepted; only omission is refused.
+    """
+    for key, label in (("actionType", "the action being executed"), ("params", "its parameters")):
+        if key not in expected:
+            return (
+                f"expected['{key}'] is required — {label} MUST come from YOUR runtime, not from the "
+                f"{artifact} (DIV §4.4.1); pass it explicitly even when it is empty"
+            )
+    return None
+
+
 @_never_raises
 def verify_approval_receipt(
     receipt: Dict[str, Any],
@@ -618,6 +661,26 @@ def verify_approval_receipt(
     if delegation is not None and not offline:
         return {"ok": False, "reason": "a delegation can only substitute the approver set for an offline approval"}
 
+    # FAIL CLOSED on a missing target or nonce, mirroring verify_delegation and the TS reference:
+    # every caller of this package is untyped, and defaulting to the receipt's OWN values would have
+    # the receipt vouch for its own scope (DIV Target Isolation) or its own challenge (DIV §5 — a
+    # stateless verifier MUST require the caller to name the nonce being redeemed).
+    if not expected.get("target"):
+        return {
+            "ok": False,
+            "reason": "expected['target'] is required — it must be YOUR target identifier, asserted "
+                      "independently of the receipt (DIV Target Isolation)",
+        }
+    if not isinstance(expected.get("nonce"), str) or not expected["nonce"]:
+        return {
+            "ok": False,
+            "reason": "expected['nonce'] is required — the caller MUST name the challenge being "
+                      "redeemed (DIV §5); a receipt cannot vouch for its own nonce",
+        }
+    binding_problem = _binding_fields_problem(expected, "receipt")
+    if binding_problem:
+        return {"ok": False, "reason": binding_problem}
+
     # Bind the receipt to the challenge the caller is redeeming, before anything else.
     if nonce != expected.get("nonce"):
         return {"ok": False, "reason": "receipt is for a different challenge"}
@@ -643,6 +706,9 @@ def verify_approval_receipt(
     requirement = payload_data.get("requirement")
     if not isinstance(requirement, dict) or not isinstance(requirement.get("requiredApprovals"), int):
         return {"ok": False, "reason": "receipt payload is missing the signed approval requirement"}
+    quorum_problem = _quorum_problem(requirement)
+    if quorum_problem:
+        return {"ok": False, "reason": quorum_problem}
     signer_class_problem = _signer_class_problem(requirement)
     if signer_class_problem:
         return {"ok": False, "reason": signer_class_problem}
@@ -681,6 +747,14 @@ def verify_approval_receipt(
                 "reason": f"offline window is {window_minutes:.1f} minutes, over the "
                           f"{MAX_OFFLINE_WINDOW_MINUTES}-minute maximum",
             }
+        # The cap above bounds the window's WIDTH; this bounds its POSITION (DIV §5a.3 rule 3).
+        # Without it a proof challenged for a date years out, with a compliant 60-minute window,
+        # verifies today and keeps verifying until that date — the pre-signed bearer capability
+        # §5a.1 rejects. NOT gated on allow_expired: that override re-examines a proof that WAS
+        # valid and has lapsed, and says nothing about one dated in the future.
+        now = as_of or datetime.now(timezone.utc)
+        if challenged.timestamp() > now.timestamp() + clock_skew_seconds:
+            return {"ok": False, "reason": "offline proof is challenged in the future (DIV §5a.3)"}
         # A hardware-key policy CANNOT be satisfied offline (DIV §5a.3 step 4). WebAuthn needs a secure
         # context and an RP ID an offline signing surface will not match, so an offline witness is
         # always a bare key. Accepting the proof anyway would silently downgrade the policy the approver
@@ -828,7 +902,8 @@ def verify_approval_receipt(
     # Under a delegation the quorum is the DELEGATED one. Already checked to equal the offline payload's
     # signed requiredApprovals, so this is the same number by a different route — stated explicitly so
     # the substitution is visible where it takes effect.
-    required = max(1, int(delegated_quorum if delegated_quorum is not None else requirement.get("requiredApprovals", 1)))
+    # Both numbers were refused above unless they are integers ≥ 1, so no floor is applied here.
+    required = int(delegated_quorum if delegated_quorum is not None else requirement["requiredApprovals"])
     if len(verified_signers) < required:
         shown = failures[:MAX_REPORTED_FAILURES]
         if len(failures) > MAX_REPORTED_FAILURES:
@@ -879,6 +954,18 @@ def verify_delegation(
     if payload_data.get("type") != DIV_DELEGATION_TYPE:
         return {"ok": False, "reason": "payload is not a div-delegation"}
 
+    # DIV §4.4.6: a Delegation REQUIRES an identity-associating anchor and MUST be refused under a
+    # key-set anchor — at seal verification too, not only when delegatedTo is enforced at use time.
+    # The sealing quorum names PEOPLE; in publicKeys mode it would count credentials instead.
+    # Checked HERE, before any payload field, so this port refuses in the same ORDER as the TS
+    # reference: a caller misconfiguring its anchor must hear about that, not about the artifact.
+    if isinstance(expected.get("approvers"), dict) and expected["approvers"].get("publicKeys"):
+        return {
+            "ok": False,
+            "reason": "a delegation requires a DID-mode trust anchor ({'dids': [...], 'resolveKey': ...}); "
+                      "a key-set anchor cannot associate identities (DIV §4.4.6)",
+        }
+
     delegated_to = payload_data.get("delegatedTo")
     if not isinstance(delegated_to, list) or not delegated_to or not all(
         isinstance(d, str) and d for d in delegated_to
@@ -918,6 +1005,12 @@ def verify_delegation(
             "reason": f"delegation window is {window_hours:.1f} hours, over the "
                       f"{MAX_DELEGATION_WINDOW_HOURS}-hour maximum",
         }
+    # Position, not just width (DIV §5a.6 step 1, mirroring §5a.3 rule 3). A forward-dated sealedAt
+    # slides the 72-hour window arbitrarily far out, and §5a.8 names that cap as Delegation's ONLY
+    # mitigation. Unconditional, like the offline mirror: allow_expired does not reach it.
+    now = as_of or datetime.now(timezone.utc)
+    if sealed.timestamp() > now.timestamp() + clock_skew_seconds:
+        return {"ok": False, "reason": "delegation is sealed in the future (DIV §5a.6)"}
 
     requester = receipt.get("requester")
     if not requester:
@@ -925,6 +1018,9 @@ def verify_delegation(
     requirement = payload_data.get("requirement")
     if not isinstance(requirement, dict) or not isinstance(requirement.get("requiredApprovals"), int):
         return {"ok": False, "reason": "delegation payload is missing the signed approval requirement"}
+    quorum_problem = _quorum_problem(requirement)
+    if quorum_problem:
+        return {"ok": False, "reason": quorum_problem}
     signer_class_problem = _signer_class_problem(requirement)
     if signer_class_problem:
         return {"ok": False, "reason": signer_class_problem}
@@ -941,6 +1037,9 @@ def verify_delegation(
             "reason": "expected['target'] is required — it must be YOUR target identifier, asserted "
                       "independently of the delegation (DIV Target Isolation)",
         }
+    binding_problem = _binding_fields_problem(expected, "delegation")
+    if binding_problem:
+        return {"ok": False, "reason": binding_problem}
 
     nonce = payload_data.get("nonce", "")
     recomputed = canonical_delegation_payload(
@@ -960,7 +1059,6 @@ def verify_delegation(
         return {"ok": False, "reason": "target/params/actionType do not match what was delegated"}
 
     if not allow_expired:
-        now = as_of or datetime.now(timezone.utc)
         if now.timestamp() > expiry.timestamp() + clock_skew_seconds:
             return {"ok": False, "reason": "delegation has expired (pass allow_expired=True for audit re-verification)"}
 
@@ -1013,7 +1111,7 @@ def verify_delegation(
             continue
         verified_signers.add(matched)
 
-    required = max(1, int(requirement.get("requiredApprovals", 1)))
+    required = int(requirement["requiredApprovals"])
     if len(verified_signers) < required:
         shown = failures[:MAX_REPORTED_FAILURES]
         if len(failures) > MAX_REPORTED_FAILURES:

@@ -2,7 +2,7 @@
 
 Independently confirm that a human cryptographically approved **exactly** the action you are about to run — in your own process, with no Intyga secret and no network call. You recompute the canonical payload from your own parameters, check it byte-matches what was signed, and verify the human's **ES256** or **WebAuthn** signature.
 
-Depends only on [`cryptography`](https://pypi.org/project/cryptography/). This is the verify-only surface of the Intyga Python SDK, published on its own so a relying party that only needs verification does not install the full client. Its canonicalization is held byte-identical to the TypeScript, Go, and Rust verifiers by shared cross-language test vectors.
+Depends only on [`cryptography`](https://pypi.org/project/cryptography/). This is the verify-only surface of the Intyga Python SDK, published on its own so a relying party that only needs verification does not install the full client. Its canonicalization is held byte-identical to the TypeScript, Go, Rust, and Java verifiers by shared cross-language test vectors.
 
 > Status: **not yet published** to PyPI. The full client (which bundles this verifier) is [`sdk-python`](https://github.com/intyga-dev/sdk-python).
 
@@ -17,11 +17,21 @@ pip install intyga-verify
 ```python
 import intyga_verify
 
-# `expected` is what you are ABOUT to execute; `nonce` is the challenge YOU issued.
-result = intyga_verify.verify_approval_receipt(
-    receipt,
-    {"actionType": "wipe_production", "params": {"target": "prod-db-1"}, "nonce": nonce},
-)
+# The approver keys YOU trust, resolved from your own key management — never from the receipt.
+# A receipt's own `signerPublicKey` proves only that the receipt is self-consistent.
+APPROVERS = {"publicKeys": [MY_ENROLLED_APPROVER_KEY_B64]}
+
+# `expected` is what you are ABOUT to execute. `target`, `nonce` and `approvers` are REQUIRED and
+# are asserted from your side; the verifier refuses outright without them.
+EXPECTED = {
+    "target": "prod-db-cluster-01",       # THIS service (DIV Target Isolation)
+    "actionType": "wipe_production",
+    "params": {"database": "prod-db-1"},
+    "nonce": nonce,                       # the challenge YOU issued
+    "approvers": APPROVERS,
+}
+
+result = intyga_verify.verify_approval_receipt(receipt, EXPECTED)
 if not result["ok"]:
     raise SystemExit(f"refusing to proceed: {result['reason']}")
 ```
@@ -35,7 +45,7 @@ A passkey assertion harvested at *any* relying party would otherwise verify, so 
 ```python
 result = intyga_verify.verify_approval_receipt(
     receipt,
-    {"actionType": "wipe_production", "params": {"target": "prod-db-1"}, "nonce": nonce},
+    EXPECTED,
     expected_origin="https://app.example.com",
     expected_rp_id="app.example.com",
 )
@@ -47,6 +57,7 @@ result = intyga_verify.verify_approval_receipt(
 - TypeScript — [`@intyga/verify`](https://github.com/intyga-dev/verify)
 - Go — [`verify-go`](https://github.com/intyga-dev/verify-go)
 - Rust — [`intyga-verify`](https://github.com/intyga-dev/verify-rust)
+- Java — [`com.intyga:intyga-verify`](https://github.com/intyga-dev/verify-java)
 
 ## License
 
