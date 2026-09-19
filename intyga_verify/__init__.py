@@ -8,7 +8,13 @@ Rust, and Java verifiers by shared cross-language test vectors.
 
 # NOTE: the pre-DIV canonical_authorization_payload / _v3 builders were removed with the v2/v3
 # formats (ADR 005/014) — do not re-add them here; verify_approval_receipt rejects v != 1.
+from . import ledger
 from .crypto import (
+    canonical_agent_authority_payload,
+    canonical_platform_intent_payload,
+    verify_agent_authority,
+    verify_platform_receipt,
+    self_certifying_did,
     stable_stringify,
     canonical_challenge_payload,
     canonical_intent_payload,
@@ -29,6 +35,12 @@ from .crypto import (
 )
 
 __all__ = [
+    "ledger",
+    "canonical_agent_authority_payload",
+    "canonical_platform_intent_payload",
+    "verify_agent_authority",
+    "verify_platform_receipt",
+    "self_certifying_did",
     "stable_stringify",
     "canonical_offline_intent_payload",
     "canonical_delegation_payload",

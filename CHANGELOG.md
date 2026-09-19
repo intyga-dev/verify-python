@@ -11,6 +11,24 @@ entry below describes a change to that extracted surface, which usually arrives 
 
 ## [Unreleased]
 
+- **Wire format: the DIV Intent Payload gained a REQUIRED `evidence` field, and it must be `null`.**
+  `div-intent-verification` and `div-offline-intent` now carry `"evidence":null` in the signed bytes
+  (DIV §4.3.4); `div-delegation`, `div-agent-authority` and `div-platform-intent` deliberately do
+  not. `null` is signed and load-bearing: it is the payload's explicit statement that the
+  authorization was not conditioned on any external fact. Verification refuses a payload whose
+  `evidence` key is absent, and refuses any non-`null` value rather than treating it as
+  unconditioned, checked before payload reconstruction so an unsupported shape does not surface as a
+  parameter mismatch. **A receipt issued before this change no longer verifies here** — DIV v1 has no
+  published consumers, so every producer, verifier and pinned vector moved together rather than a
+  version being negotiated.
+
+- Align cross-language receipt and audit verification: platform receipts, agent-authority seals,
+  self-certifying DID trust, single/multi-event bundles, embedded ES256 signatures, tenant sequence
+  checks, checkpoint continuity, anchor quorum and Rekor. Shared executable fixtures cover valid
+  artifacts and refusals; no wire format changes.
+- Refuse unknown witness signature algorithms. Require identity-bound trust when the signed
+  `requesterCannotApprove` rule is set; key-only trust cannot enforce requester identity.
+
 - **Refuse a forward-dated offline proof or delegation (DIV §5a.3 rule 3, §5a.6 step 1).** The
   window caps bounded a proof's WIDTH but never its POSITION, so a quorum-signed proof dated years
   ahead with a compliant 60-minute (or 72-hour) window verified today and kept verifying until that

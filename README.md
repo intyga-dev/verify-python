@@ -53,6 +53,37 @@ result = intyga_verify.verify_approval_receipt(
 
 `require_user_verification` defaults to `True`; pass `False` to accept mere user presence. Policy `AUTO_APPROVED` receipts carry no human signature and fail closed unless you pass `allow_auto_approved=True`.
 
+## Receipt and audit verification
+
+The package also exports `verify_platform_receipt`, `verify_agent_authority` and `ledger`.
+The ledger module exposes `verify_bundle`, `verify_evidence_bundle`, `verify_roots_chain`,
+`verify_anchor_signature` and `verify_anchor_quorum`. It is assembled from the same source as
+`intyga_sdk`, including the shared cross-language regression fixtures.
+
+The five language verifiers support the same receipt and audit verification features, pinned by
+`canonical-vectors.json`, `ledger-vectors.json` and `verifier-parity-vectors.json`:
+
+- DIV approval/offline/delegation receipts, agent-authority seals (§5b), and platform receipts (§5c).
+  Platform receipts require WebAuthn and caller-pinned digest, RP, nonce, origin and subject keys.
+  Authority/delegation verification never substitutes for approval of an action.
+- Self-certifying DIDs, with explicit caller key mappings taking precedence.
+- DEWP single-event and multi-event proof bundles: inclusion, canonical content/header binding,
+  embedded ES256 signatures, tenant identity, sequence gaps/duplicates and claimed range endpoints.
+- Checkpoint continuity (§5.4), and anchor quorum (§5.3) under the caller's policy: ES256, Ed25519,
+  RSA-PSS and Rekor SET/payload verification under a separately pinned log key.
+
+Trust inputs must come from the caller. A root carried in the bundle proves only internal
+consistency; a producer's `externallyAnchored` flag is a claim, not verification. Bundle-carried
+anchors can count under caller-trusted keys, but only independently fetched, checkpoint-attributed
+anchors may establish divergence. For multi-checkpoint exports, key caller anchors by checkpoint ID
+or root; a flat list cannot establish exact attribution across checkpoints.
+
+Limits remain explicit: no NDJSON evidence streaming, no RFC 3161/CMS verification, and no WEBHOOK
+anchor verifier. Those anchors do not count toward quorum. No implementation claims the complete
+DEWP Extended Profile (§9.2). Embedded WebAuthn material is incomplete in the audit leaf; verify the
+full DIV receipt separately. Offline authority verification checks the seal, not subsequent online
+revocation. Verification does not consume a nonce or prove execution.
+
 ## Also available in
 - TypeScript — [`@intyga/verify`](https://github.com/intyga-dev/verify)
 - Go — [`verify-go`](https://github.com/intyga-dev/verify-go)

@@ -23,6 +23,8 @@ DIV_OFFLINE_INTENT_TYPE = "div-offline-intent"
 # pre-declared action to named local operators. It authorizes NOTHING on its own —
 # verify_approval_receipt refuses this type outright, with no opt-in. Use verify_delegation.
 DIV_DELEGATION_TYPE = "div-delegation"
+DIV_AGENT_AUTHORITY_TYPE = "div-agent-authority"
+DIV_PLATFORM_INTENT_TYPE = "div-platform-intent"
 # Hard cap on an offline proof's validity window, enforced at verification and not only at mint. An
 # offline relying party has no revocation channel, so the short window is the only bound (DIV §5a.3).
 MAX_OFFLINE_WINDOW_MINUTES = 60
@@ -219,6 +221,11 @@ def canonical_intent_payload(
             "actionType": action_type,
             "display": display,
             "params": params,
+            # DIV §4.3.4. Reserved and REQUIRED in the bytes; None states that no external-evidence
+            # condition applied. A literal, never requirement.get("evidence") — a caller that omitted
+            # it would then mint bytes no verifier reproduces, the same trap the signerClass default
+            # below exists to avoid.
+            "evidence": None,
             "requester": req,
             "requirement": rq,
             "nonce": nonce,
@@ -299,6 +306,11 @@ def canonical_offline_intent_payload(
             "actionType": action_type,
             "display": display,
             "params": params,
+            # DIV §4.3.4. Reserved and REQUIRED in the bytes; None states that no external-evidence
+            # condition applied. A literal, never requirement.get("evidence") — a caller that omitted
+            # it would then mint bytes no verifier reproduces, the same trap the signerClass default
+            # below exists to avoid.
+            "evidence": None,
             "requester": req,
             "requirement": rq,
             "nonce": nonce,
@@ -346,6 +358,34 @@ def canonical_delegation_payload(
             "expiresAt": expires_at,
         }
     )
+
+
+def canonical_agent_authority_payload(
+    target: str, action_patterns: list, display: str, agent: Dict[str, Any],
+    requester: Dict[str, Any], requirement: Dict[str, Any], nonce: str,
+    sealed_at: str, expires_at: str,
+) -> str:
+    """DIV §5b governance evidence; never an execution approval."""
+    req, rq = _canonical_common(requester, requirement)
+    return stable_stringify({
+        "v": DIV_VERSION, "type": DIV_AGENT_AUTHORITY_TYPE, "target": target,
+        "actionPatterns": sorted(action_patterns, key=lambda p: p.encode("utf-16-be")),
+        "display": display, "agent": {"did": agent["did"]}, "requester": req,
+        "requirement": rq, "nonce": nonce, "sealedAt": sealed_at, "expiresAt": expires_at,
+    })
+
+
+def canonical_platform_intent_payload(
+    payload_hash: str, rp_id: str, subject_external_id: str, signed_at: str,
+    expires_at: str, nonce: str,
+) -> str:
+    """Reproduce DIV §5c bytes; digest validation belongs to the verifier."""
+    return stable_stringify({
+        "v": DIV_VERSION, "type": DIV_PLATFORM_INTENT_TYPE, "hashAlg": "SHA-256",
+        "payloadHash": payload_hash, "rpId": rp_id,
+        "subject": {"externalId": subject_external_id}, "signedAt": signed_at,
+        "expiresAt": expires_at, "nonce": nonce,
+    })
 
 
 def canonical_action_payload(nonce: str, action_type: str, summary: str, params: Dict[str, Any]) -> str:
@@ -518,6 +558,27 @@ def _parse_rfc3339(ts: str):
 #: The signer classes this verifier can reason about (DIV §4.3.2). "human" is the only class
 #: defined today.
 KNOWN_SIGNER_CLASSES = frozenset({"human"})
+
+
+def _evidence_problem(payload_data: Dict[str, Any]) -> "str | None":
+    """Validate the reserved ``evidence`` field out of the signed bytes (DIV §4.3.4).
+
+    REQUIRED to be present and REQUIRED to be ``None`` in v1. A non-null value is an
+    evidence-conditioned authorization whose semantics this verifier has not been taught, and must
+    never verify as if it were unconditioned.
+
+    Uses ``in`` for presence and an identity check for the value, never ``.get()``: ``.get()``
+    returns ``None`` for an absent key AND for a present null, so it cannot express the distinction
+    this check is made of. Collapsing the two turns the whole reservation into a no-op.
+    """
+    if "evidence" not in payload_data:
+        return "the signed payload is missing evidence (DIV §4.3.4)"
+    if payload_data["evidence"] is not None:
+        return (
+            "the signed payload declares an evidence condition, which this verifier does not "
+            "support — refusing rather than treating it as unconditioned (DIV §4.3.4)"
+        )
+    return None
 
 
 def _signer_class_problem(requirement: Dict[str, Any]) -> "str | None":
@@ -712,6 +773,11 @@ def verify_approval_receipt(
     signer_class_problem = _signer_class_problem(requirement)
     if signer_class_problem:
         return {"ok": False, "reason": signer_class_problem}
+    # DIV §5-step-3c. Before Local Payload Reconstruction, so an unsupported payload shape does not
+    # surface as a params mismatch.
+    evidence_problem = _evidence_problem(payload_data)
+    if evidence_problem:
+        return {"ok": False, "reason": evidence_problem}
     # Offline proofs carry challengedAt so the validity WINDOW can be bounded here, not merely at mint.
     challenged_at = ""
     if offline:
@@ -772,6 +838,16 @@ def verify_approval_receipt(
     delegated_to = None
     delegated_quorum = None
     if delegation is not None:
+        delegation_expiry = _parse_rfc3339(delegation.get("expiresAt"))
+        if delegation_expiry is None:
+            return {"ok": False, "reason": "delegation expiresAt is not a valid RFC3339 timestamp"}
+        if not allow_expired:
+            now = as_of or datetime.now(timezone.utc)
+            if now.timestamp() > delegation_expiry.timestamp() + clock_skew_seconds:
+                return {
+                    "ok": False,
+                    "reason": "delegation has expired (pass allow_expired=True for audit re-verification)",
+                }
         if delegation.get("target") != expected.get("target"):
             return {"ok": False, "reason": "the delegation was issued for a different target"}
         if delegation.get("actionType") != expected.get("actionType"):
@@ -863,6 +939,8 @@ def verify_approval_receipt(
 
     # Count DISTINCT approvers whose signature verifies under a key we independently trust. Distinct
     # is load-bearing: without it, N copies of one approver's signature would satisfy an N-of-M quorum.
+    if requirement.get("requesterCannotApprove") is True and approvers.get("publicKeys"):
+        return {"ok": False, "reason": "requesterCannotApprove requires a DID-mode trust anchor"}
     verified_signers = set()
     failures = []
     for witness in witnesses:
@@ -1079,6 +1157,8 @@ def verify_delegation(
             "reason": f"delegation carries {len(witnesses)} witnesses, above the maximum of {MAX_WITNESSES}",
         }
 
+    if requirement.get("requesterCannotApprove") is True and approvers.get("publicKeys"):
+        return {"ok": False, "reason": "requesterCannotApprove requires a DID-mode trust anchor"}
     verified_signers = set()
     failures = []
     for witness in witnesses:
@@ -1155,12 +1235,17 @@ def _witnesses_of(receipt: Dict[str, Any]) -> list:
         }]
     return []
 
+def self_certifying_did(public_key_b64: str) -> str:
+    """Commit to exact decoded enrolled key bytes, matching the gateway and TS verifier."""
+    return "did:intyga:key:" + base64url_encode(hashlib.sha256(base64_decode_flexible(public_key_b64)).digest())
+
+
 def _candidate_keys(approvers: Dict[str, Any], witness: Dict[str, Any], restrict_to=None):
     """
     The keys we will accept this witness under, drawn ENTIRELY from the caller's trust anchor.
 
-    ``witness['signerPublicKey']`` is never used as a verification key — only, in DID mode, as a claim
-    about WHICH approver is speaking, which we answer with the caller's own resolver. Returns
+    Keys come from the caller's allowlist/resolver, or are authenticated by hashing the witness's
+    carried key against a caller-pinned self-certifying DID. Returns
     ``(candidates, None)`` or ``(None, reason)``; each candidate is ``(key, identity)`` so quorum
     counts distinct APPROVERS. In publicKeys mode the identity is the key itself, because the
     receipt's ``signerDid`` is an unverified string there and counting it would let one approver
@@ -1194,17 +1279,20 @@ def _candidate_keys(approvers: Dict[str, Any], witness: Dict[str, Any], restrict
         return None, f"signer {signer_did or '(unknown)'} is not an authorized approver"
     if restrict_to is not None and signer_did not in restrict_to:
         return None, f"signer {signer_did} is not named in the delegation"
-    if not callable(resolve):
-        return None, "approvers.dids requires a resolveKey callable"
-    resolved = resolve(signer_did)
-    if not resolved:
-        return None, f"no trusted key could be resolved for {signer_did}"
+    resolved = resolve(signer_did) if callable(resolve) else None
     keys = resolved if isinstance(resolved, (list, tuple)) else [resolved]
     # All keys for one DID share that DID as their identity, so quorum still counts one approver.
     candidates = [(k, signer_did) for k in keys if k]
-    if not candidates:
-        return None, f"no trusted key could be resolved for {signer_did}"
-    return candidates, None
+    if candidates:
+        return candidates, None
+    # A caller-pinned key-derived DID independently authenticates the carried key. Never infer
+    # trust from an arbitrary receipt DID, and never override a nonempty caller key mapping.
+    if signer_did.startswith("did:intyga:key:"):
+        carried = witness.get("signerPublicKey")
+        if not carried or self_certifying_did(carried) != signer_did:
+            return None, "witness public key does not hash to the pinned self-certifying DID"
+        return [(carried, signer_did)], None
+    return None, f"no trusted key could be resolved for {signer_did}"
 
 def _verify_witness(
     witness: Dict[str, Any],
@@ -1220,7 +1308,9 @@ def _verify_witness(
     if not signature:
         return False, "witness missing signature"
 
-    if witness.get("sigAlg") != "WEBAUTHN":
+    if witness.get("sigAlg") not in ("ES256", "WEBAUTHN"):
+        return False, "unsupported witness signature algorithm"
+    if witness.get("sigAlg") == "ES256":
         if not verify_ecdsa_p256(trusted_key, canonical_payload, signature):
             return False, "signature does not verify against the trusted signer key"
         return True, None
@@ -1290,6 +1380,163 @@ def _verify_witness(
         return True, None
     except Exception as e:
         return False, f"WebAuthn verification failed: {str(e)}"
+
+def _parity_signers(receipt, approvers, requirement, requester, *, platform=False,
+                    expected_origin=None, expected_rp_id=None,
+                    require_user_verification=True, allow_cross_origin=False):
+    """Check new receipt families using the same trust and signature primitives as approvals."""
+    witnesses = _witnesses_of(receipt)
+    if not witnesses or len(witnesses) > MAX_WITNESSES:
+        return set(), ["missing signature material or witness limit exceeded"]
+    if requirement.get("requesterCannotApprove") is True and approvers.get("publicKeys"):
+        return set(), ["requesterCannotApprove requires a DID-mode trust anchor"]
+    signers, failures = set(), []
+    for witness in witnesses:
+        if not isinstance(witness, dict):
+            failures.append("malformed witness")
+            continue
+        if platform and witness.get("sigAlg") != "WEBAUTHN":
+            failures.append("platform receipts are WebAuthn-only")
+            continue
+        candidates, reason = _candidate_keys(approvers, witness)
+        if reason:
+            failures.append(reason)
+            continue
+        matched = None
+        reason = "signature does not verify against any trusted key"
+        for key, identity in candidates:
+            valid, reason = _verify_witness(witness, key, receipt["canonicalPayload"],
+                expected_origin, expected_rp_id, require_user_verification, allow_cross_origin)
+            if valid:
+                matched = identity
+                break
+        if matched is None:
+            failures.append(reason)
+            continue
+        if requirement.get("requireHardwareKey") is True and witness.get("sigAlg") != "WEBAUTHN":
+            failures.append("signed policy requires a hardware-backed WebAuthn credential")
+            continue
+        if requirement.get("requesterCannotApprove") is True and witness.get("signerDid") == requester.get("did"):
+            failures.append("four-eyes: requester cannot seal their own request")
+            continue
+        signers.add(matched)
+    return signers, failures[:MAX_REPORTED_FAILURES]
+
+
+@_never_raises
+def verify_platform_receipt(receipt: Dict[str, Any], expected: Dict[str, Any], *,
+    expected_origin=None, expected_rp_id=None, require_user_verification: bool = True,
+    allow_cross_origin: bool = False, allow_expired: bool = False, as_of=None,
+    clock_skew_seconds: float = DEFAULT_CLOCK_SKEW_SECONDS,
+) -> Dict[str, Any]:
+    """Verify a §5c WebAuthn receipt against YOUR digest, RP, nonce and subject trust anchor.
+
+    Does not redeem the nonce. Single use remains the executing application's responsibility.
+    No auto-approval override exists for this receipt family.
+    """
+    payload = json.loads(receipt.get("canonicalPayload", ""))
+    if not isinstance(payload, dict) or type(payload.get("v")) is not int or payload["v"] != DIV_VERSION:
+        return {"ok": False, "reason": "unsupported DIV payload version"}
+    if payload.get("type") != DIV_PLATFORM_INTENT_TYPE:
+        return {"ok": False, "reason": "payload is not a div-platform-intent"}
+    nonce = expected.get("nonce")
+    if not isinstance(nonce, str) or not nonce or payload.get("nonce") != nonce:
+        return {"ok": False, "reason": "receipt is for a different challenge or nonce is missing"}
+    approvers = expected.get("approvers")
+    if not isinstance(approvers, dict) or not (approvers.get("dids") or approvers.get("publicKeys")):
+        return {"ok": False, "reason": "expected.approvers is required"}
+    digest, rp_id = expected.get("payloadHash"), expected.get("rpId")
+    if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        return {"ok": False, "reason": "expected.payloadHash must be 64-character lowercase hex"}
+    if not isinstance(rp_id, str) or not rp_id:
+        return {"ok": False, "reason": "expected.rpId is required"}
+    if expected_rp_id is not None and expected_rp_id != rp_id:
+        return {"ok": False, "reason": "expected_rp_id conflicts with expected.rpId"}
+    subject = payload.get("subject")
+    external_id = subject.get("externalId") if isinstance(subject, dict) else None
+    if not isinstance(external_id, str) or not external_id:
+        return {"ok": False, "reason": "receipt missing subject.externalId"}
+    if "subjectExternalId" in expected and expected["subjectExternalId"] != external_id:
+        return {"ok": False, "reason": "receipt was signed by a different subject"}
+    signed_at, expires_at = payload.get("signedAt"), payload.get("expiresAt")
+    signed, expiry = _parse_rfc3339(signed_at), _parse_rfc3339(expires_at)
+    if signed is None or expiry is None:
+        return {"ok": False, "reason": "signedAt/expiresAt is not a valid RFC3339 timestamp"}
+    recomputed = canonical_platform_intent_payload(digest, rp_id, external_id, signed_at, expires_at, nonce)
+    if recomputed != receipt["canonicalPayload"]:
+        return {"ok": False, "reason": "payloadHash/rpId do not match what was signed"}
+    now = as_of or datetime.now(timezone.utc)
+    if expiry < signed:
+        return {"ok": False, "reason": "receipt expires before it was signed"}
+    if signed.timestamp() > now.timestamp() + clock_skew_seconds:
+        return {"ok": False, "reason": "receipt is signed in the future"}
+    if not allow_expired and now.timestamp() > expiry.timestamp() + clock_skew_seconds:
+        return {"ok": False, "reason": "proof has expired"}
+    if receipt.get("sigAlg") == "AUTO_APPROVED":
+        return {"ok": False, "reason": "a platform receipt cannot be auto-approved"}
+    signers, failures = _parity_signers(receipt, approvers, {}, {}, platform=True,
+        expected_origin=expected_origin, expected_rp_id=rp_id,
+        require_user_verification=require_user_verification, allow_cross_origin=allow_cross_origin)
+    if not signers:
+        return {"ok": False, "reason": "no valid subject signature: " + "; ".join(failures)}
+    return {"ok": True, "signers": sorted(signers)}
+
+
+@_never_raises
+def verify_agent_authority(receipt: Dict[str, Any], expected: Dict[str, Any], *,
+    expected_origin=None, expected_rp_id=None, require_user_verification: bool = True,
+    allow_cross_origin: bool = False, allow_expired: bool = False, as_of=None,
+    clock_skew_seconds: float = DEFAULT_CLOCK_SKEW_SECONDS,
+) -> Dict[str, Any]:
+    """Verify §5b governance evidence. This never approves execution or proves non-revocation."""
+    payload = json.loads(receipt.get("canonicalPayload", ""))
+    if not isinstance(payload, dict) or type(payload.get("v")) is not int or payload["v"] != DIV_VERSION:
+        return {"ok": False, "reason": "unsupported DIV payload version"}
+    if payload.get("type") != DIV_AGENT_AUTHORITY_TYPE:
+        return {"ok": False, "reason": "payload is not a div-agent-authority"}
+    patterns = payload.get("actionPatterns")
+    if not isinstance(patterns, list) or not patterns or not all(isinstance(p, str) and p for p in patterns):
+        return {"ok": False, "reason": "authority is missing a valid actionPatterns set"}
+    target, agent_did = expected.get("target"), expected.get("agentDid")
+    if not isinstance(target, str) or not target or not isinstance(agent_did, str) or not agent_did:
+        return {"ok": False, "reason": "expected.target and expected.agentDid are required"}
+    approvers = expected.get("approvers")
+    if not isinstance(approvers, dict) or not (approvers.get("dids") or approvers.get("publicKeys")):
+        return {"ok": False, "reason": "expected.approvers is required"}
+    requester, requirement = receipt.get("requester"), payload.get("requirement")
+    if not isinstance(requester, dict) or not isinstance(requirement, dict):
+        return {"ok": False, "reason": "authority missing requester or signed approval requirement"}
+    problem = _quorum_problem(requirement) or _signer_class_problem(requirement)
+    if problem:
+        return {"ok": False, "reason": problem}
+    sealed_at, expires_at, nonce = payload.get("sealedAt"), payload.get("expiresAt"), payload.get("nonce", "")
+    sealed, expiry = _parse_rfc3339(sealed_at), _parse_rfc3339(expires_at)
+    if sealed is None or expiry is None:
+        return {"ok": False, "reason": "sealedAt/expiresAt is not a valid RFC3339 timestamp"}
+    if expiry < sealed:
+        return {"ok": False, "reason": "authority expires before it was sealed"}
+    now = as_of or datetime.now(timezone.utc)
+    if sealed.timestamp() > now.timestamp() + clock_skew_seconds:
+        return {"ok": False, "reason": "authority is sealed in the future"}
+    recomputed = canonical_agent_authority_payload(target, patterns, receipt.get("actionDescription", ""),
+        {"did": agent_did}, requester, requirement, nonce, sealed_at, expires_at)
+    if recomputed != receipt["canonicalPayload"]:
+        return {"ok": False, "reason": "target/agent/actionPatterns do not match what was sealed"}
+    if not allow_expired and now.timestamp() > expiry.timestamp() + clock_skew_seconds:
+        return {"ok": False, "reason": "authority has expired"}
+    if receipt.get("sigAlg") == "AUTO_APPROVED":
+        return {"ok": False, "reason": "an agent authority cannot be auto-approved"}
+    signers, failures = _parity_signers(receipt, approvers, requirement, requester,
+        expected_origin=expected_origin, expected_rp_id=expected_rp_id,
+        require_user_verification=require_user_verification, allow_cross_origin=allow_cross_origin)
+    if len(signers) < requirement["requiredApprovals"]:
+        return {"ok": False, "reason": "authority sealing quorum not met: " + "; ".join(failures)}
+    return {"ok": True, "authority": {
+        "agentDid": agent_did, "target": target,
+        "actionPatterns": sorted(set(patterns), key=lambda p: p.encode("utf-16-be")),
+        "nonce": nonce, "signers": sorted(signers), "sealedAt": sealed_at, "expiresAt": expires_at,
+    }}
+
 
 # ── Policy Crypto Namespace ───────────────────────────────────────────────────
 
