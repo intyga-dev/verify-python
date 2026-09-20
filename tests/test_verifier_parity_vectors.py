@@ -64,7 +64,8 @@ class TestVerifierParityVectors(unittest.TestCase):
                 target=raw["target"], action_patterns=raw["actionPatterns"],
                 display=raw["actionDescription"], agent={"did": raw["agentDid"]},
                 requester=raw["requester"], requirement=raw["requirement"],
-                nonce=raw["nonce"], sealed_at=raw["sealedAt"], expires_at=raw["expiresAt"]
+                nonce=raw["nonce"], sealed_at=raw["sealedAt"], expires_at=raw["expiresAt"],
+                parent_receipt_hash=raw["parentReceiptHash"]
             ), item["expected"]
         )
     for item in vectors["platformIntentPayloads"]["cases"]:

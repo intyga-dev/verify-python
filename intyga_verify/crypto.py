@@ -5,8 +5,10 @@ import hmac
 import json
 import math
 import os
+import re
+import unicodedata
 from datetime import datetime, timezone
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Optional
 
 # DIV protocol constants (docs/DIV.md v1).
 DIV_VERSION = 1
@@ -197,6 +199,7 @@ def canonical_intent_payload(
     requirement: Dict[str, Any],
     nonce: str,
     expires_at: str,
+    agent_context: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Canonical DIV Intent Payload (docs/DIV.md v1).
 
@@ -213,8 +216,7 @@ def canonical_intent_payload(
     identical policies produce different signed bytes.
     """
     req, rq = _canonical_common(requester, requirement)
-    return stable_stringify(
-        {
+    payload = {
             "v": DIV_VERSION,
             "type": DIV_INTENT_TYPE,
             "target": target,
@@ -229,9 +231,13 @@ def canonical_intent_payload(
             "requester": req,
             "requirement": rq,
             "nonce": nonce,
-            "expiresAt": expires_at,
         }
-    )
+    if agent_context is None:
+        payload["expiresAt"] = expires_at
+    else:
+        payload.update({key: agent_context[key] for key in ("action", "agent", "session", "nbf")})
+        payload["exp"] = expires_at
+    return stable_stringify(payload)
 
 
 
@@ -363,14 +369,14 @@ def canonical_delegation_payload(
 def canonical_agent_authority_payload(
     target: str, action_patterns: list, display: str, agent: Dict[str, Any],
     requester: Dict[str, Any], requirement: Dict[str, Any], nonce: str,
-    sealed_at: str, expires_at: str,
+    sealed_at: str, expires_at: str, parent_receipt_hash: Optional[str] = None,
 ) -> str:
     """DIV §5b governance evidence; never an execution approval."""
     req, rq = _canonical_common(requester, requirement)
     return stable_stringify({
         "v": DIV_VERSION, "type": DIV_AGENT_AUTHORITY_TYPE, "target": target,
         "actionPatterns": sorted(action_patterns, key=lambda p: p.encode("utf-16-be")),
-        "display": display, "agent": {"did": agent["did"]}, "requester": req,
+        "display": display, "agent": {"did": agent["did"]}, "parentReceiptHash": parent_receipt_hash, "requester": req,
         "requirement": rq, "nonce": nonce, "sealedAt": sealed_at, "expiresAt": expires_at,
     })
 
@@ -553,6 +559,59 @@ def _parse_rfc3339(ts: str):
         return datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except Exception:
         return None
+
+
+_AGENT_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_AGENT_SEQUENCE = re.compile(r"[1-9][0-9]{0,17}\Z")
+_AGENT_DECIMAL = re.compile(r"(?:0|[1-9][0-9]{0,29})(?:\.[0-9]{1,9})?\Z")
+_AGENT_CURRENCY = re.compile(r"[A-Z]{3}\Z")
+_AGENT_TIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z\Z")
+
+
+def _validate_agent_context(context, exp, sig_alg):
+    """Validate the PEP's independently supplied agent context before reconstructing bytes."""
+    action = context.get("action")
+    if not isinstance(action, dict) or action.get("reversibility") not in ("reversible", "irreversible"):
+        return "invalid agent action reversibility"
+    agent = context.get("agent")
+    if not isinstance(agent, dict):
+        return "invalid agent identity or configuration digest"
+    label, config_digest = agent.get("label"), agent.get("configDigest")
+    if not isinstance(label, str) or not label or len(label.encode("utf-16-le")) // 2 > 200 or not isinstance(config_digest, str) or not _AGENT_DIGEST.fullmatch(config_digest):
+        return "invalid agent identity or configuration digest"
+    session = context.get("session")
+    if not isinstance(session, dict):
+        return "invalid agent session identity or sequence"
+    session_id = session.get("id")
+    if unicodedata.normalize("NFC", label) != label or not isinstance(session_id, str) or unicodedata.normalize("NFC", session_id) != session_id:
+        return "agent labels and session identifiers must be NFC"
+    delegated_by = agent.get("delegatedBy")
+    if "delegatedBy" not in agent or (delegated_by is not None and (not isinstance(delegated_by, str) or not _AGENT_DIGEST.fullmatch(delegated_by))):
+        return "invalid parent authority digest"
+    seq = session.get("seq")
+    if not _AGENT_DIGEST.fullmatch(session_id) or not isinstance(seq, str) or not _AGENT_SEQUENCE.fullmatch(seq):
+        return "invalid agent session identity or sequence"
+    prev = session.get("prev")
+    if "prev" not in session or (seq == "1") != (prev is None) or (prev is not None and (not isinstance(prev, str) or not _AGENT_DIGEST.fullmatch(prev))):
+        return "invalid agent session predecessor"
+    def valid_money(value):
+        return isinstance(value, dict) and isinstance(value.get("amount"), str) and bool(_AGENT_DECIMAL.fullmatch(value["amount"])) and isinstance(value.get("currency"), str) and bool(_AGENT_CURRENCY.fullmatch(value["currency"]))
+    amount, aggregate = action.get("amount"), session.get("aggregate")
+    if "amount" not in action or "aggregate" not in session:
+        return "invalid agent monetary amount"
+    if (amount is not None and not valid_money(amount)) or (aggregate is not None and not valid_money(aggregate)):
+        return "invalid agent monetary amount"
+    if (amount is None) != (aggregate is None) or (amount is not None and amount["currency"] != aggregate["currency"]):
+        return "agent monetary amount and aggregate disagree"
+    nbf = context.get("nbf")
+    if not isinstance(nbf, str) or not isinstance(exp, str) or not _AGENT_TIME.fullmatch(nbf) or not _AGENT_TIME.fullmatch(exp):
+        return "agent intent must use canonical UTC times within five minutes"
+    from_time, to_time = _parse_rfc3339(nbf), _parse_rfc3339(exp)
+    if from_time is None or to_time is None or not from_time < to_time or (to_time - from_time).total_seconds() > 300:
+        return "agent intent must use canonical UTC times within five minutes"
+    if action["reversibility"] == "irreversible" and sig_alg == "AUTO_APPROVED":
+        return "irreversible agent action requires a human signature"
+    return None
 
 
 #: The signer classes this verifier can reason about (DIV §4.3.2). "human" is the only class
@@ -759,9 +818,27 @@ def verify_approval_receipt(
             "reason": "expected['approvers'] is required — the Approver key MUST come from your own "
                       "trust policy, never from the receipt (DIV Invariant 3)",
         }
-    expires_at = payload_data.get("expiresAt")
+    agent_intent = "agent" in payload_data
+    agent_context = expected.get("agentContext")
+    if agent_intent and not isinstance(agent_context, dict):
+        return {"ok": False, "reason": "agent receipt requires independently asserted PEP context"}
+    if not agent_intent and agent_context is not None:
+        return {"ok": False, "reason": "agent context was expected but is absent from the signed payload"}
+    expires_at = payload_data.get("exp" if agent_intent else "expiresAt")
     if not isinstance(expires_at, str) or not expires_at:
-        return {"ok": False, "reason": "receipt missing expiresAt"}
+        return {"ok": False, "reason": "receipt missing expiration"}
+    if agent_intent:
+        context_problem = _validate_agent_context(agent_context, expires_at, receipt.get("sigAlg"))
+        if context_problem:
+            return {"ok": False, "reason": "invalid independently asserted agent context: " + context_problem}
+        agent = agent_context.get("agent")
+        if isinstance(agent, dict) and agent.get("delegatedBy") is not None:
+            return {"ok": False, "reason": "delegated agent receipt requires a trusted root-to-leaf authority chain"}
+        nbf = _parse_rfc3339(agent_context.get("nbf"))
+        expiry = _parse_rfc3339(expires_at)
+        now = as_of or datetime.now(timezone.utc)
+        if nbf.timestamp() > now.timestamp() + clock_skew_seconds:
+            return {"ok": False, "reason": "agent approval is not valid yet"}
     # The requirement is part of the SIGNED bytes, so reading it back out of the payload is not
     # circular: a forged value changes the string and fails the byte comparison below.
     requirement = payload_data.get("requirement")
@@ -888,6 +965,7 @@ def verify_approval_receipt(
             requirement=requirement,
             nonce=nonce,
             expires_at=expires_at,
+            agent_context=agent_context if agent_intent else None,
         )
     if recomputed != canonical_payload:
         return {"ok": False, "reason": "target/params/actionType do not match what was approved"}
@@ -1497,6 +1575,11 @@ def verify_agent_authority(receipt: Dict[str, Any], expected: Dict[str, Any], *,
     patterns = payload.get("actionPatterns")
     if not isinstance(patterns, list) or not patterns or not all(isinstance(p, str) and p for p in patterns):
         return {"ok": False, "reason": "authority is missing a valid actionPatterns set"}
+    if "parentReceiptHash" not in payload:
+        return {"ok": False, "reason": "authority is missing parentReceiptHash"}
+    parent = payload["parentReceiptHash"]
+    if parent is not None and (not isinstance(parent, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", parent)):
+        return {"ok": False, "reason": "authority has invalid parentReceiptHash"}
     target, agent_did = expected.get("target"), expected.get("agentDid")
     if not isinstance(target, str) or not target or not isinstance(agent_did, str) or not agent_did:
         return {"ok": False, "reason": "expected.target and expected.agentDid are required"}
@@ -1519,7 +1602,7 @@ def verify_agent_authority(receipt: Dict[str, Any], expected: Dict[str, Any], *,
     if sealed.timestamp() > now.timestamp() + clock_skew_seconds:
         return {"ok": False, "reason": "authority is sealed in the future"}
     recomputed = canonical_agent_authority_payload(target, patterns, receipt.get("actionDescription", ""),
-        {"did": agent_did}, requester, requirement, nonce, sealed_at, expires_at)
+        {"did": agent_did}, requester, requirement, nonce, sealed_at, expires_at, parent)
     if recomputed != receipt["canonicalPayload"]:
         return {"ok": False, "reason": "target/agent/actionPatterns do not match what was sealed"}
     if not allow_expired and now.timestamp() > expiry.timestamp() + clock_skew_seconds:
@@ -1534,6 +1617,7 @@ def verify_agent_authority(receipt: Dict[str, Any], expected: Dict[str, Any], *,
     return {"ok": True, "authority": {
         "agentDid": agent_did, "target": target,
         "actionPatterns": sorted(set(patterns), key=lambda p: p.encode("utf-16-be")),
+        "parentReceiptHash": parent,
         "nonce": nonce, "signers": sorted(signers), "sealedAt": sealed_at, "expiresAt": expires_at,
     }}
 
