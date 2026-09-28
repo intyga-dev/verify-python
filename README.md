@@ -38,6 +38,24 @@ if not result["ok"]:
 
 One byte of drift — a swapped target, an appended region — and verification fails, because the signature was over the exact bytes you just recomputed.
 
+## Whose quorum? (the requirement floor)
+
+The signed `requirement` is the signers' own statement: its signature stops a third party from
+altering it, not the approvers it constrains from writing a weaker one. One approver who is also the
+requester can sign a 1-of-1 payload alone. **Without a floor this verifier proves only the quorum the
+signers stated.** When you know the rule, add it to the expectation (DIV §5 step 3d):
+
+```python
+EXPECTED["requirement"] = {"requiredApprovals": 3, "requesterCannotApprove": True}
+```
+
+A signed requirement weaker on any field — fewer approvals, no four-eyes or no hardware key where the
+floor demands one — is refused before any signature is counted, with a reason starting "signed
+requirement is weaker than the relying party's policy"; an equal or stricter one passes. A malformed
+floor (quorum below 1) is refused rather than ignored. The same field exists on the delegation
+expectation (pass the ordinary rule) and the agent-authority expectation (your sealing policy).
+Omitting it keeps the previous behaviour.
+
 ## WebAuthn (passkey) receipts
 
 A passkey assertion harvested at *any* relying party would otherwise verify, so WebAuthn receipts require you to pin the expected origin and RP ID:
@@ -60,6 +78,14 @@ The ledger module exposes `verify_bundle`, `verify_evidence_bundle`, `verify_roo
 `verify_anchor_signature` and `verify_anchor_quorum`. It is assembled from the same source as
 `intyga_sdk`, including the shared cross-language regression fixtures.
 
+RFC 3161 anchors can be checked with `verify_rfc3161_anchor(anchor, trust)` and count toward quorum
+when `external_keys={"rfc3161": {issuer: trust}}` is supplied. This optional adapter invokes an
+installed OpenSSL 3 executable without network access. Trust pins the CA and TSA certificate digest;
+`revocation` must explicitly be `"crl"` with an offline CRL or `"unchecked"`. The caller may select
+an integer `verification_time`; the default rounds the current time up by at most one second so a
+fresh fractional timestamp is not spuriously rejected. Historical verification proves certificate
+validity at issuance but cannot reconstruct historical revocation state.
+
 The five language verifiers support the same receipt and audit verification features, pinned by
 `canonical-vectors.json`, `ledger-vectors.json` and `verifier-parity-vectors.json`:
 
@@ -77,8 +103,10 @@ consistency; a producer's `externallyAnchored` flag is a claim, not verification
 anchors can count under caller-trusted keys, but only independently fetched, checkpoint-attributed
 anchors may establish divergence. For multi-checkpoint exports, key caller anchors by checkpoint ID
 or root; a flat list cannot establish exact attribution across checkpoints.
+For a multi-issuer policy, scope the Rekor key with `external_keys["rekor_issuer"]`; an unscoped
+legacy key is accepted only when exactly one issuer is trusted.
 
-Limits remain explicit: no NDJSON evidence streaming, no RFC 3161/CMS verification, and no WEBHOOK
+Limits remain explicit: no NDJSON evidence streaming and no WEBHOOK
 anchor verifier. Those anchors do not count toward quorum. No implementation claims the complete
 DEWP Extended Profile (§9.2). Embedded WebAuthn material is incomplete in the audit leaf; verify the
 full DIV receipt separately. Offline authority verification checks the seal, not subsequent online

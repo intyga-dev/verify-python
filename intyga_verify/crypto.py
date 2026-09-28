@@ -7,7 +7,7 @@ import math
 import os
 import re
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Tuple, Optional
 
 # DIV protocol constants (docs/DIV.md v1).
@@ -82,6 +82,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 # WebAuthn authenticatorData flag bits (WebAuthn L3 §6.1).
 AUTH_DATA_FLAG_UP = 0x01  # User Present
 AUTH_DATA_FLAG_UV = 0x04  # User Verified
+AUTH_DATA_FLAG_BE = 0x08  # Backup Eligible — the credential may be synced to other devices
+AUTH_DATA_FLAG_BS = 0x10  # Backup State — the credential is currently backed up
 
 def base64url_encode(data: bytes) -> str:
     """Encode bytes to base64url format without padding."""
@@ -156,6 +158,24 @@ def format_jcs_number(value: "int | float") -> str:
     return json.dumps(value)
 
 
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _canonical_string(s: str) -> str:
+    """A string (value or member name) as RFC 8785 serializes it, refusing invalid Unicode.
+
+    RFC 8785 builds on I-JSON (RFC 7493 §2.1), which forbids unpaired surrogates. ``json.loads``
+    yields one from a ``\\udXXX`` escape, and ``json.dumps`` would emit it raw — bytes no UTF-8
+    encoder can produce — so such a string is refused (DIV §4.1). In a Python ``str`` every
+    surrogate code point is unpaired: a valid pair decodes to one astral character.
+    """
+    if not isinstance(s, str):
+        raise NonCanonicalValue("object keys must be strings")
+    if _SURROGATE.search(s):
+        raise NonCanonicalValue("a string contains an unpaired UTF-16 surrogate, which is not I-JSON")
+    return json.dumps(s, ensure_ascii=False)
+
+
 def stable_stringify(value: Any) -> str:
     """Deterministic JSON stringification with UTF-16 code unit sorted keys."""
     if value is None:
@@ -166,14 +186,14 @@ def stable_stringify(value: Any) -> str:
         _check_portable_number(value)
         return format_jcs_number(value)
     if isinstance(value, str):
-        return json.dumps(value, ensure_ascii=False)
+        return _canonical_string(value)
     if isinstance(value, (list, tuple)):
         return "[" + ",".join(stable_stringify(x) for x in value) + "]"
     if isinstance(value, dict):
-        keys = sorted(value.keys(), key=lambda k: k.encode("utf-16-be"))
+        keys = sorted(value.keys(), key=lambda k: k.encode("utf-16-be", "surrogatepass"))
         parts = []
         for k in keys:
-            k_str = json.dumps(k, ensure_ascii=False)
+            k_str = _canonical_string(k)
             v_str = stable_stringify(value[k])
             parts.append(f"{k_str}:{v_str}")
         return "{" + ",".join(parts) + "}"
@@ -553,12 +573,38 @@ def parse_cose_public_key(cose_bytes: bytes) -> Tuple[bytes, bytes]:
 
     return coordinate(-2, "x"), coordinate(-3, "y")
 
+# RFC 3339 §5.6 `date-time`, strictly: four-digit year, uppercase T and Z, seconds present, an
+# optional 1-9 digit fraction and an explicit zone with offset hours 00-23, minutes 00-59.
+_RFC3339 = re.compile(
+    r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\.([0-9]{1,9}))?"
+    r"(Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])\Z"
+)
+
+
 def _parse_rfc3339(ts: str):
-    """Parse an RFC3339 timestamp to an aware datetime, or None. Accepts a trailing 'Z'."""
-    try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except Exception:
+    """Parse a signed RFC 3339 timestamp to an aware datetime, or None (DIV §6.2).
+
+    One grammar in every port: the date must exist, hours 00-23, minutes and seconds 00-59 (no leap
+    second). ``datetime.fromisoformat`` alone accepted a bare date (returning a NAIVE datetime), a
+    zone-less time, a space separator and lowercase separators, where the Go port refused them.
+    """
+    if not isinstance(ts, str):
         return None
+    m = _RFC3339.match(ts)
+    if not m:
+        return None
+    try:
+        base = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+    micros = int((m.group(2) or "0").ljust(9, "0")[:6])
+    zone = m.group(3)
+    if zone == "Z":
+        tz = timezone.utc
+    else:
+        delta = timedelta(hours=int(zone[1:3]), minutes=int(zone[4:6]))
+        tz = timezone(-delta if zone[0] == "-" else delta)
+    return base.replace(microsecond=micros, tzinfo=tz)
 
 
 _AGENT_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -677,6 +723,46 @@ def _quorum_problem(requirement: Dict[str, Any]) -> "str | None":
     return None
 
 
+#: The reason stem every port uses for a signed requirement below the caller's floor.
+WEAKER_REQUIREMENT_REASON = "signed requirement is weaker than the relying party's policy"
+
+
+def _requirement_floor_problem(requirement: Dict[str, Any], expected: Any) -> "str | None":
+    """DIV §5 step 3d: compare the SIGNED requirement against the relying party's own floor.
+
+    The signed requirement is authored by whoever composed the bytes the approvers signed — the
+    issuer, or any one approver composing their own payload — so its signature protects it against
+    third parties but NOT against the signers the quorum constrains. Without a floor a verifier proves
+    only the signers' OWN stated quorum: an approver who is also the requester can sign
+    ``{"requiredApprovals": 1, "requesterCannotApprove": False}`` alone and it verifies.
+
+    ``expected["requirement"]`` (optional, STRONGLY RECOMMENDED) is
+    ``{"requiredApprovals": int >= 1, "requesterCannotApprove": bool, "requireHardwareKey": bool}``
+    (both flags default False). Only strictly weaker signed values are refused. Absent means "no
+    floor" (legacy behaviour); a malformed floor fails CLOSED rather than silently meaning "no floor".
+    """
+    floor = expected.get("requirement") if isinstance(expected, dict) else None
+    if floor is None:
+        return None
+    required = floor.get("requiredApprovals") if isinstance(floor, dict) else None
+    flags = [floor.get(k, False) for k in ("requesterCannotApprove", "requireHardwareKey")] if isinstance(floor, dict) else []
+    if (
+        not isinstance(required, int) or isinstance(required, bool) or required < 1
+        or not all(isinstance(f, bool) for f in flags)
+    ):
+        return ("expected.requirement is malformed: requiredApprovals must be an integer of at least 1 "
+                "and the flags booleans")
+    signed = requirement.get("requiredApprovals")
+    if signed < required:
+        return (f"{WEAKER_REQUIREMENT_REASON}: it requires {signed} approval(s), the policy {required} "
+                "(DIV §5 step 3d)")
+    if floor.get("requesterCannotApprove") is True and requirement.get("requesterCannotApprove") is not True:
+        return f"{WEAKER_REQUIREMENT_REASON}: it does not forbid the requester approving (DIV §5 step 3d)"
+    if floor.get("requireHardwareKey") is True and requirement.get("requireHardwareKey") is not True:
+        return f"{WEAKER_REQUIREMENT_REASON}: it does not require a hardware key (DIV §5 step 3d)"
+    return None
+
+
 def _binding_fields_problem(expected: Dict[str, Any], artifact: str) -> "str | None":
     """Require the caller to state ``actionType`` and ``params`` (DIV §4.4.1).
 
@@ -694,6 +780,37 @@ def _binding_fields_problem(expected: Dict[str, Any], artifact: str) -> "str | N
                 f"{artifact} (DIV §4.4.1); pass it explicitly even when it is empty"
             )
     return None
+
+
+def _backup_flags_problem(witness: Dict[str, Any]) -> Optional[str]:
+    """Under a signed ``requireHardwareKey``, a WEBAUTHN witness whose authenticatorData carries the
+    Backup Eligible or Backup State flag cannot count (DIV §4.4.5 rule 6). The flags are covered by
+    the assertion signature, so a relying party can catch an issuer that let a synced passkey sign a
+    hardware-pinned action. BE=0 is the authenticator's own claim, not attestation. Called only for a
+    witness that already verified, so authenticatorData decodes to at least 37 bytes."""
+    if witness.get("sigAlg") != "WEBAUTHN":
+        return None
+    try:
+        auth_data = base64_decode_flexible(witness.get("authenticatorData") or "")
+    except Exception:
+        return "authenticatorData is unreadable"
+    if len(auth_data) < 37:
+        return "authenticatorData is unreadable"
+    if not auth_data[32] & (AUTH_DATA_FLAG_BE | AUTH_DATA_FLAG_BS):
+        return None
+    return (
+        f"signer {witness.get('signerDid')} used a backup-eligible (synced) passkey — authenticatorData "
+        "BE/BS flag set — but the signed policy requires a hardware-backed WebAuthn credential"
+    )
+
+
+def requires_hardware_credential(requirement: Dict[str, Any]) -> bool:
+    """A signed requirement only a hardware-backed WebAuthn credential can meet: ``requireHardwareKey``
+    or a non-empty ``allowedAaguids`` model allowlist. A bare key satisfies neither and neither can be
+    met offline (DIV §4.3.2), so every check treats them alike."""
+    aaguids = requirement.get("allowedAaguids") if isinstance(requirement, dict) else None
+    return bool(isinstance(requirement, dict) and (
+        requirement.get("requireHardwareKey") is True or (isinstance(aaguids, list) and len(aaguids) > 0)))
 
 
 @_never_raises
@@ -728,6 +845,12 @@ def verify_approval_receipt(
     these params, for exactly this target and nonce; the number of distinct valid signatures meets the
     quorum recorded in the signed payload; the requester did not self-approve when the signed policy
     forbids it; and the proof has not expired.
+
+    THE SIGNED QUORUM IS THE SIGNERS' OWN STATEMENT. One approver (possibly the requester) can sign a
+    1-of-1 payload alone. Pass ``expected["requirement"]`` — your own rule, e.g.
+    ``{"requiredApprovals": 3, "requesterCannotApprove": True}`` — and a weaker signed requirement is
+    refused (DIV §5 step 3d). Without it, "quorum met" means only "the quorum the signers stated".
+    Under a delegation pass the ORDINARY rule; the delegated quorum must already be at least as strict.
 
     Expiry (DIV §5.8/§6.2) is enforced fail-closed by default; pass allow_expired=True ONLY for
     post-hoc audit re-verification. WEBAUTHN receipts additionally require expected_origin and
@@ -839,8 +962,9 @@ def verify_approval_receipt(
         now = as_of or datetime.now(timezone.utc)
         if nbf.timestamp() > now.timestamp() + clock_skew_seconds:
             return {"ok": False, "reason": "agent approval is not valid yet"}
-    # The requirement is part of the SIGNED bytes, so reading it back out of the payload is not
-    # circular: a forged value changes the string and fails the byte comparison below.
+    # The requirement is part of the SIGNED bytes, so a third party cannot alter it: a forged value
+    # changes the string and fails the byte comparison below. It does NOT bind the signers themselves
+    # — they authored it — which is why step 3d compares it against expected["requirement"].
     requirement = payload_data.get("requirement")
     if not isinstance(requirement, dict) or not isinstance(requirement.get("requiredApprovals"), int):
         return {"ok": False, "reason": "receipt payload is missing the signed approval requirement"}
@@ -850,6 +974,9 @@ def verify_approval_receipt(
     signer_class_problem = _signer_class_problem(requirement)
     if signer_class_problem:
         return {"ok": False, "reason": signer_class_problem}
+    floor_problem = _requirement_floor_problem(requirement, expected)
+    if floor_problem:
+        return {"ok": False, "reason": floor_problem}
     # DIV §5-step-3c. Before Local Payload Reconstruction, so an unsupported payload shape does not
     # surface as a params mismatch.
     evidence_problem = _evidence_problem(payload_data)
@@ -901,8 +1028,9 @@ def verify_approval_receipt(
         # A hardware-key policy CANNOT be satisfied offline (DIV §5a.3 step 4). WebAuthn needs a secure
         # context and an RP ID an offline signing surface will not match, so an offline witness is
         # always a bare key. Accepting the proof anyway would silently downgrade the policy the approver
-        # attested to, so it is refused instead — fail closed, and say why.
-        if requirement.get("requireHardwareKey") is True:
+        # attested to, so it is refused instead — fail closed, and say why. A non-empty
+        # authenticator-model allowlist is the same class of policy: a bare key has no model at all.
+        if requires_hardware_credential(requirement):
             return {
                 "ok": False,
                 "reason": "the signed policy requires a hardware-backed WebAuthn credential, which "
@@ -1017,9 +1145,12 @@ def verify_approval_receipt(
 
     # Count DISTINCT approvers whose signature verifies under a key we independently trust. Distinct
     # is load-bearing: without it, N copies of one approver's signature would satisfy an N-of-M quorum.
+    if requirement["requiredApprovals"] > 1 and approvers.get("publicKeys"):
+        return {"ok": False, "reason": "multi-approver quorum requires a DID-mode trust anchor (DIV §5 step 3b)"}
     if requirement.get("requesterCannotApprove") is True and approvers.get("publicKeys"):
         return {"ok": False, "reason": "requesterCannotApprove requires a DID-mode trust anchor"}
     verified_signers = set()
+    counted_keys: Dict[bytes, str] = {}
     failures = []
     for witness in witnesses:
         candidates, reason = _candidate_keys(approvers, witness, delegated_to)
@@ -1027,6 +1158,7 @@ def verify_approval_receipt(
             failures.append(reason)
             continue
         matched = None
+        matched_key = None
         last_reason = "signature does not verify against any trusted approver key"
         for key, identity in candidates:
             ok, why = _verify_witness(
@@ -1035,6 +1167,7 @@ def verify_approval_receipt(
             )
             if ok:
                 matched = identity
+                matched_key = key
                 break
             last_reason = why
         if matched is None:
@@ -1043,15 +1176,24 @@ def verify_approval_receipt(
         # A hardware-key policy is only partially checkable offline: a bare P-256 key carries no
         # attestation at all, so it can never satisfy the requirement, while a WebAuthn assertion is
         # accepted without proving the authenticator's model.
-        if requirement.get("requireHardwareKey") is True and witness.get("sigAlg") != "WEBAUTHN":
+        if requires_hardware_credential(requirement) and witness.get("sigAlg") != "WEBAUTHN":
             failures.append(
                 f"signer {witness.get('signerDid')} used a bare key, but the signed policy requires "
                 "a hardware-backed WebAuthn credential"
             )
             continue
+        if requirement.get("requireHardwareKey") is True:
+            synced = _backup_flags_problem(witness)
+            if synced:
+                failures.append(synced)
+                continue
         # Four-eyes, verified offline against the requester in the same signed payload.
         if requirement.get("requesterCannotApprove") is True and witness.get("signerDid") == requester.get("did"):
             failures.append(f"four-eyes: requester {witness.get('signerDid')} cannot approve their own action")
+            continue
+        shared = _shared_key_problem(counted_keys, matched_key, matched)
+        if shared:
+            failures.append(shared)
             continue
         verified_signers.add(matched)
 
@@ -1180,6 +1322,9 @@ def verify_delegation(
     signer_class_problem = _signer_class_problem(requirement)
     if signer_class_problem:
         return {"ok": False, "reason": signer_class_problem}
+    floor_problem = _requirement_floor_problem(requirement, expected)
+    if floor_problem:
+        return {"ok": False, "reason": floor_problem}
     approvers = expected.get("approvers")
     if not isinstance(approvers, dict) or not (approvers.get("publicKeys") or approvers.get("dids")):
         return {
@@ -1235,9 +1380,12 @@ def verify_delegation(
             "reason": f"delegation carries {len(witnesses)} witnesses, above the maximum of {MAX_WITNESSES}",
         }
 
+    if requirement["requiredApprovals"] > 1 and approvers.get("publicKeys"):
+        return {"ok": False, "reason": "multi-approver quorum requires a DID-mode trust anchor (DIV §5 step 3b)"}
     if requirement.get("requesterCannotApprove") is True and approvers.get("publicKeys"):
         return {"ok": False, "reason": "requesterCannotApprove requires a DID-mode trust anchor"}
     verified_signers = set()
+    counted_keys: Dict[bytes, str] = {}
     failures = []
     for witness in witnesses:
         candidates, reason = _candidate_keys(approvers, witness)
@@ -1245,6 +1393,7 @@ def verify_delegation(
             failures.append(reason)
             continue
         matched = None
+        matched_key = None
         last_reason = "signature does not verify against any trusted approver key"
         for key, identity in candidates:
             ok, why = _verify_witness(
@@ -1253,19 +1402,29 @@ def verify_delegation(
             )
             if ok:
                 matched = identity
+                matched_key = key
                 break
             last_reason = why
         if matched is None:
             failures.append(last_reason)
             continue
-        if requirement.get("requireHardwareKey") is True and witness.get("sigAlg") != "WEBAUTHN":
+        if requires_hardware_credential(requirement) and witness.get("sigAlg") != "WEBAUTHN":
             failures.append(
                 f"signer {witness.get('signerDid')} used a bare key, but the signed policy requires "
                 "a hardware-backed WebAuthn credential"
             )
             continue
+        if requirement.get("requireHardwareKey") is True:
+            synced = _backup_flags_problem(witness)
+            if synced:
+                failures.append(synced)
+                continue
         if requirement.get("requesterCannotApprove") is True and witness.get("signerDid") == requester.get("did"):
             failures.append(f"four-eyes: requester {witness.get('signerDid')} cannot delegate to themselves")
+            continue
+        shared = _shared_key_problem(counted_keys, matched_key, matched)
+        if shared:
+            failures.append(shared)
             continue
         verified_signers.add(matched)
 
@@ -1372,6 +1531,29 @@ def _candidate_keys(approvers: Dict[str, Any], witness: Dict[str, Any], restrict
         return [(carried, signer_did)], None
     return None, f"no trusted key could be resolved for {signer_did}"
 
+def _shared_key_problem(counted: Dict[bytes, str], key: str, identity: str) -> Optional[str]:
+    """One key, one person (DIV §4.4.6).
+
+    An identity-associating anchor that maps the SAME key to two DIDs would otherwise let that key's
+    holder count as two approvers, since quorum counts distinct identities. A key already counted for
+    one identity cannot count for another. Keys compare by decoded bytes (padding and base64/base64url
+    spellings of one encoding match; the same key in another encoding, COSE vs SPKI, is not detected).
+    Records the key when it is free.
+    """
+    try:
+        fingerprint = base64_decode_flexible(key)
+    except Exception:
+        fingerprint = key.encode("utf-8", "surrogatepass")
+    owner = counted.get(fingerprint)
+    if owner is not None and owner != identity:
+        return (
+            f"signer {identity} verified under a key already counted for {owner}; "
+            "two approver identities sharing one key count once (DIV §4.4.6)"
+        )
+    counted[fingerprint] = identity
+    return None
+
+
 def _verify_witness(
     witness: Dict[str, Any],
     trusted_key: str,
@@ -1386,9 +1568,10 @@ def _verify_witness(
     if not signature:
         return False, "witness missing signature"
 
-    if witness.get("sigAlg") not in ("ES256", "WEBAUTHN"):
+    # DIV §4.4.2: unknown/absent labels fall back to ES256, except AUTO_APPROVED.
+    if witness.get("sigAlg") == "AUTO_APPROVED" or (witness.get("sigAlg") is not None and not isinstance(witness["sigAlg"], str)):
         return False, "unsupported witness signature algorithm"
-    if witness.get("sigAlg") == "ES256":
+    if witness.get("sigAlg") != "WEBAUTHN":
         if not verify_ecdsa_p256(trusted_key, canonical_payload, signature):
             return False, "signature does not verify against the trusted signer key"
         return True, None
@@ -1418,6 +1601,10 @@ def _verify_witness(
         # (W3C WebAuthn L3 §7.2 step 9).
         if client_data.get("crossOrigin") is True and not allow_cross_origin:
             return False, "assertion was produced in a cross-origin frame (crossOrigin=true)"
+        # A topOrigin that differs from origin is the same embedding reported another way, refused
+        # exactly like crossOrigin=true (DIV §4.4.5 rule 5) — the gateway refuses it at ingest.
+        if "topOrigin" in client_data and client_data["topOrigin"] != client_data.get("origin") and not allow_cross_origin:
+            return False, "assertion was produced in a frame embedded by another origin (topOrigin differs from origin)"
 
         expected_challenge = base64url_encode(canonical_payload.encode("utf-8"))
         client_challenge_clean = client_data.get("challenge", "").replace("=", "")
@@ -1466,9 +1653,12 @@ def _parity_signers(receipt, approvers, requirement, requester, *, platform=Fals
     witnesses = _witnesses_of(receipt)
     if not witnesses or len(witnesses) > MAX_WITNESSES:
         return set(), ["missing signature material or witness limit exceeded"]
+    if not platform and requirement["requiredApprovals"] > 1 and approvers.get("publicKeys"):
+        return set(), ["multi-approver quorum requires a DID-mode trust anchor (DIV §5 step 3b)"]
     if requirement.get("requesterCannotApprove") is True and approvers.get("publicKeys"):
         return set(), ["requesterCannotApprove requires a DID-mode trust anchor"]
     signers, failures = set(), []
+    counted_keys: Dict[bytes, str] = {}
     for witness in witnesses:
         if not isinstance(witness, dict):
             failures.append("malformed witness")
@@ -1481,21 +1671,32 @@ def _parity_signers(receipt, approvers, requirement, requester, *, platform=Fals
             failures.append(reason)
             continue
         matched = None
+        matched_key = None
         reason = "signature does not verify against any trusted key"
         for key, identity in candidates:
             valid, reason = _verify_witness(witness, key, receipt["canonicalPayload"],
                 expected_origin, expected_rp_id, require_user_verification, allow_cross_origin)
             if valid:
                 matched = identity
+                matched_key = key
                 break
         if matched is None:
             failures.append(reason)
             continue
-        if requirement.get("requireHardwareKey") is True and witness.get("sigAlg") != "WEBAUTHN":
+        if requires_hardware_credential(requirement) and witness.get("sigAlg") != "WEBAUTHN":
             failures.append("signed policy requires a hardware-backed WebAuthn credential")
             continue
+        if requirement.get("requireHardwareKey") is True:
+            synced = _backup_flags_problem(witness)
+            if synced:
+                failures.append(synced)
+                continue
         if requirement.get("requesterCannotApprove") is True and witness.get("signerDid") == requester.get("did"):
             failures.append("four-eyes: requester cannot seal their own request")
+            continue
+        shared = _shared_key_problem(counted_keys, matched_key, matched)
+        if shared:
+            failures.append(shared)
             continue
         signers.add(matched)
     return signers, failures[:MAX_REPORTED_FAILURES]
@@ -1552,9 +1753,11 @@ def verify_platform_receipt(receipt: Dict[str, Any], expected: Dict[str, Any], *
         return {"ok": False, "reason": "proof has expired"}
     if receipt.get("sigAlg") == "AUTO_APPROVED":
         return {"ok": False, "reason": "a platform receipt cannot be auto-approved"}
+    # User verification is UNCONDITIONAL on this plane (DIV §5c.3): the ordinary-receipt waiver
+    # require_user_verification=False is accepted for signature compatibility but never honoured.
     signers, failures = _parity_signers(receipt, approvers, {}, {}, platform=True,
         expected_origin=expected_origin, expected_rp_id=rp_id,
-        require_user_verification=require_user_verification, allow_cross_origin=allow_cross_origin)
+        require_user_verification=True, allow_cross_origin=allow_cross_origin)
     if not signers:
         return {"ok": False, "reason": "no valid subject signature: " + "; ".join(failures)}
     return {"ok": True, "signers": sorted(signers)}
@@ -1589,7 +1792,10 @@ def verify_agent_authority(receipt: Dict[str, Any], expected: Dict[str, Any], *,
     requester, requirement = receipt.get("requester"), payload.get("requirement")
     if not isinstance(requester, dict) or not isinstance(requirement, dict):
         return {"ok": False, "reason": "authority missing requester or signed approval requirement"}
-    problem = _quorum_problem(requirement) or _signer_class_problem(requirement)
+    problem = (
+        _quorum_problem(requirement) or _signer_class_problem(requirement)
+        or _requirement_floor_problem(requirement, expected)
+    )
     if problem:
         return {"ok": False, "reason": problem}
     sealed_at, expires_at, nonce = payload.get("sealedAt"), payload.get("expiresAt"), payload.get("nonce", "")

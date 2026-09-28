@@ -9,6 +9,8 @@ to raw bytes before hashing; the anchor signature covers the raw 32-byte digest.
 
 import hashlib
 import json
+import re
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 LEAF_TAG = b"\x00"
@@ -249,11 +251,46 @@ def verify_inclusion_proof(proof: Dict[str, Any], daily_root: str) -> bool:
 
 # ── Signed anchors (DEWP §5.2) ────────────────────────────────────────────────────────────────────
 def anchor_preimage(anchor: Dict[str, str]) -> str:
-    """JCS of [dailyRoot, timestamp, issuer, algorithm] — for string arrays this is compact JSON."""
+    """JCS of [dailyRoot, timestamp, issuer, algorithm, seqStart, seqEnd, chainHash] — for string
+    arrays this is compact JSON. The last three bind the checkpoint's POSITION (DEWP §5.2)."""
     return json.dumps(
-        [anchor["dailyRoot"], anchor["timestamp"], anchor["issuer"], anchor["algorithm"]],
+        [anchor["dailyRoot"], anchor["timestamp"], anchor["issuer"], anchor["algorithm"],
+         anchor["seqStart"], anchor["seqEnd"], anchor["chainHash"]],
         separators=(",", ":"),
         ensure_ascii=False,
+    )
+
+
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+_SEQ = re.compile(r"[0-9]{1,20}")
+_DEWP_TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z")
+
+
+def parse_anchor_timestamp_ms(ts: Any) -> Optional[int]:
+    """Milliseconds since the epoch for an exact DEWP §4.3 timestamp (YYYY-MM-DDTHH:mm:ss.sssZ), else
+    None. Strict for the same reason as the TypeScript reference: every port must read one instant."""
+    if not isinstance(ts, str) or not _DEWP_TIMESTAMP.fullmatch(ts):
+        return None
+    try:
+        parsed = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return int(parsed.timestamp()) * 1000 + parsed.microsecond // 1000
+
+
+def is_well_formed_anchor(anchor: Any) -> bool:
+    """All seven signed fields present with the shapes DEWP §5.2 requires. A missing position field is
+    refused rather than hashed: the preimage would not be the one any conformant producer signed."""
+    return bool(
+        isinstance(anchor, dict)
+        and isinstance(anchor.get("dailyRoot"), str) and _HEX64.fullmatch(anchor["dailyRoot"])
+        and parse_anchor_timestamp_ms(anchor.get("timestamp")) is not None
+        and isinstance(anchor.get("issuer"), str)
+        # §5.2 algorithm registry: the label is signed, so any other one is not a §5.2 anchor at all.
+        and anchor.get("algorithm") in ("ES256", "Ed25519", "RSA-PSS")
+        and isinstance(anchor.get("seqStart"), str) and _SEQ.fullmatch(anchor["seqStart"])
+        and isinstance(anchor.get("seqEnd"), str) and _SEQ.fullmatch(anchor["seqEnd"])
+        and isinstance(anchor.get("chainHash"), str) and _HEX64.fullmatch(anchor["chainHash"])
     )
 
 
@@ -268,7 +305,7 @@ def verify_anchor_signature(anchor: Dict[str, Any], public_key_spki_b64: str) ->
     The message is the raw domain-separated digest; quorum is a separate check.
     """
     try:
-        if not isinstance(anchor, dict) or anchor.get("algorithm") not in ("ES256", "Ed25519", "RSA-PSS"):
+        if not is_well_formed_anchor(anchor) or anchor.get("algorithm") not in ("ES256", "Ed25519", "RSA-PSS"):
             return False
         signature_b64 = anchor.get("signature")
         if not isinstance(signature_b64, str) or not signature_b64:
@@ -296,10 +333,12 @@ def verify_anchor_signature(anchor: Dict[str, Any], public_key_spki_b64: str) ->
             public_key.verify(signature, digest)
             return True
         if anchor["algorithm"] == "RSA-PSS":
-            if not isinstance(public_key, rsa.RSAPublicKey):
+            # DEWP §5.2 RSA-PSS profile: a modulus of at least 2048 bits, SHA-256 with MGF1-SHA-256
+            # and a salt exactly the hash length. PSS.AUTO accepted any salt length.
+            if not isinstance(public_key, rsa.RSAPublicKey) or public_key.key_size < 2048:
                 return False
             public_key.verify(signature, digest,
-                padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.AUTO),
+                padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=32),
                 hashes.SHA256())
             return True
         if not isinstance(public_key, ec.EllipticCurvePublicKey):
@@ -331,21 +370,54 @@ def verify_anchor_signature(anchor: Dict[str, Any], public_key_spki_b64: str) ->
 
 # ── Bundle verification with the DEWP §7.1 property model ─────────────────────────────────────────
 def verify_bundle(bundle: Dict[str, Any], trusted_root: Optional[str] = None, *,
-                  anchors=None, anchor_policy=None, resolve_anchor_key=None, external_keys=None) -> Dict[str, Any]:
+                  anchors=None, anchor_policy=None, resolve_anchor_key=None, external_keys=None,
+                  trusted_checkpoint=None) -> Dict[str, Any]:
     """Verify a single inclusion-proof bundle. Returns the four independent properties + summary level.
 
     `trusted_root` is independently obtained. Anchor verification additionally requires the
     caller's policy and trusted-key resolver; the bundle alone never establishes root provenance.
+
+    `trusted_checkpoint` is the caller's record of the proof's checkpoint (its roots-file line, a dict
+    with ``root`` and optionally ``seqStart``/``seqEnd``/``entryCount``/``anchoredAt``/``chainHash``). A
+    single proof carries no checkpoint, so without it no EXTERNAL anchor counts: the DEWP §5.3 time
+    bound would be measured against the anchor's own producer-chosen timestamp. Its root stands in for
+    `trusted_root` when that is absent and must equal it otherwise; its entry count bounds the proof's
+    leaf counts.
     """
     try:
         return _verify_bundle_checked(bundle, trusted_root, anchors=anchors, anchor_policy=anchor_policy,
-                                      resolve_anchor_key=resolve_anchor_key, external_keys=external_keys)
+                                      resolve_anchor_key=resolve_anchor_key, external_keys=external_keys,
+                                      trusted_checkpoint=trusted_checkpoint)
     except Exception as exc:
         return _invalid(f"malformed bundle or verification input ({type(exc).__name__})")
 
 
-def _verify_bundle_checked(bundle, trusted_root, *, anchors, anchor_policy, resolve_anchor_key, external_keys):
+def _supported_envelope(bundle):
+    # Numeric revisions 1 and 2 without a protocol is the legacy export format, not a future version.
+    protocol, version = bundle.get("protocol"), bundle.get("version")
+    if protocol is not None and protocol != "DEWP":
+        return False
+    if version != "1.0" and not (protocol is None and type(version) in (int, float) and version in (1, 2)):
+        return False
+    if "algorithmRegistry" not in bundle:
+        return True
+    a = bundle["algorithmRegistry"]
+    return (isinstance(a, dict) and a.get("hashAlgorithm") == "SHA-256"
+            and a.get("serialization") == "RFC8785-JCS"
+            and type(a.get("merkleVersion")) in (int, float) and a["merkleVersion"] == 1)
+
+
+def _verify_bundle_checked(bundle, trusted_root, *, anchors, anchor_policy, resolve_anchor_key, external_keys,
+                           trusted_checkpoint=None):
     notes: List[str] = []
+    if trusted_checkpoint is not None and not isinstance(trusted_checkpoint, dict):
+        return _invalid("trusted_checkpoint must be a checkpoint record")
+    conflict = bool(trusted_checkpoint is not None and trusted_root is not None
+                    and trusted_checkpoint.get("root") != trusted_root)
+    if conflict:
+        notes.append("the supplied trusted checkpoint names a different root than trusted_root; refusing to pick one")
+    if trusted_root is None and trusted_checkpoint is not None:
+        trusted_root = trusted_checkpoint.get("root")
 
     # Every field below comes from an untrusted artifact. Shape-check before use: a verifier that
     # raises on a malformed bundle has not returned "invalid", it has crashed, and a caller that
@@ -369,6 +441,9 @@ def _verify_bundle_checked(bundle, trusted_root, *, anchors, anchor_policy, reso
     kind = bundle.get("kind")
     if kind != BUNDLE_KIND:
         return _invalid(f'refusing bundle kind "{kind}" (expected "{BUNDLE_KIND}") — DEWP §6.5')
+
+    if not _supported_envelope(bundle):
+        return _invalid("unsupported DEWP protocol, version or algorithm registry")
 
     # DEWP §4.5: an unknown Application Profile means the leaf layout is one this port cannot
     # reproduce. Leaf binding is then NOT ATTEMPTED (None), never silently "failed" — and the bundle
@@ -395,22 +470,29 @@ def _verify_bundle_checked(bundle, trusted_root, *, anchors, anchor_policy, reso
     )
     if trusted_root is not None:
         daily_root = trusted_root
-        root_source = "independent"
+        # The verifier cannot tell a root recorded independently from one copied out of this bundle,
+        # so it reports only what it knows: the caller supplied it.
+        root_source = "caller-supplied"
     elif self_asserted_root:
         daily_root = self_asserted_root
         root_source = "self-asserted"
         notes.append(
-            "no independent root supplied — verifying against the root inside the bundle. This "
-            "proves the bundle is internally consistent, NOT that it matches the anchored log; "
-            "re-run with the root from the external anchor for a real verdict"
+            "no root supplied — verifying against the root inside the bundle. This proves the bundle "
+            "is internally consistent, NOT that it matches the anchored log; re-run with a root you "
+            "obtained earlier or from the published roots file for a real verdict"
         )
     else:
         daily_root = None
         root_source = "none"
         notes.append("no daily root available (event not yet committed to an anchored checkpoint)")
 
+    # DEWP §17.3: the proof's own leaf counts are bound to the trusted checkpoint's entry count.
+    count_mismatch = (leaf_count_mismatch(proof, trusted_checkpoint.get("entryCount"))
+                      if trusted_checkpoint is not None and daily_root == trusted_checkpoint.get("root") else None)
+    if count_mismatch:
+        notes.append(count_mismatch)
     try:
-        inclusion_ok = daily_root is not None and verify_inclusion_proof(proof, daily_root)
+        inclusion_ok = daily_root is not None and not count_mismatch and verify_inclusion_proof(proof, daily_root)
     except Exception:
         inclusion_ok = False
     root_consistency = daily_root is not None and proof.get("checkpointRoot") == daily_root
@@ -465,13 +547,20 @@ def _verify_bundle_checked(bundle, trusted_root, *, anchors, anchor_policy, reso
 
     signature_verified = bool(content_verified and canonical and verify_embedded_signature(canonical))
     anchor_verified, divergence = False, False
-    if anchor_policy is not None and callable(resolve_anchor_key) and daily_root:
+    witness_times: Dict[str, int] = {}
+    external_check = bool(external_keys and (external_keys.get("rekor") or external_keys.get("rfc3161")))
+    if anchor_policy is not None and (callable(resolve_anchor_key) or external_check) and daily_root:
         candidates = anchors if anchors is not None else [
             *(bundle.get("anchors") or []), *([bundle["anchor"]] if bundle.get("anchor") else [])]
+        # The caller's record is the only position and time an anchor over a single proof can be held
+        # to; an empty expectation keeps external witnesses from counting without one.
+        record = trusted_checkpoint or {}
+        expected = {k: record.get(k) for k in ("seqStart", "seqEnd", "chainHash", "anchoredAt")}
         verdict = verify_anchor_quorum(candidates, daily_root, anchor_policy, resolve_anchor_key,
-            divergence_anchors=anchors or [], external_keys=external_keys)
+            divergence_anchors=anchors or [], external_keys=external_keys, checkpoint=expected)
         anchor_verified = commitment_verified and verdict["ok"]
         divergence = verdict["divergence"]
+        witness_times = verdict.get("witnessTimes") or {}
         if divergence:
             notes.append("ANCHOR DIVERGENCE: " + verdict.get("reason", "conflicting roots"))
         elif not verdict["ok"]:
@@ -481,9 +570,9 @@ def _verify_bundle_checked(bundle, trusted_root, *, anchors, anchor_policy, reso
         if verdict.get("note"):
             notes.append(verdict["note"])
     elif anchor_policy is not None:
-        notes.append("Anchor quorum could not be evaluated: a daily root and resolve_anchor_key are required")
-    elif commitment_verified and root_source == "independent":
-        notes.append("An independently supplied root was used, but no anchor quorum policy was supplied; anchorVerified stays false")
+        notes.append("Anchor quorum could not be evaluated: a daily root and caller trust are required")
+    elif commitment_verified and root_source == "caller-supplied":
+        notes.append("A caller-supplied root was used, but no anchor quorum policy was supplied; anchorVerified stays false")
 
     # DEWP §6.2 asks verifiers to SURFACE the producer's own quorum claim alongside their verdict.
     # Reporting it is not trusting it: `anchor_verified` above is the independent check, not this
@@ -528,7 +617,8 @@ def _verify_bundle_checked(bundle, trusted_root, *, anchors, anchor_policy, reso
     return {
         "ok": bool(
             commitment_verified
-            and root_source == "independent"
+            and not conflict
+            and root_source == "caller-supplied"
             and leaf_binding is not False
             and header_binding is not False
             and content_bound_when_present
@@ -537,6 +627,7 @@ def _verify_bundle_checked(bundle, trusted_root, *, anchors, anchor_policy, reso
         ),
         "dailyRoot": daily_root,
         "rootSource": root_source,
+        "witnessTimes": witness_times,
         "properties": properties,
         "checks": {"leafBinding": leaf_binding, "headerBinding": header_binding},
         "verificationLevel": level,
@@ -549,6 +640,7 @@ def _invalid(reason: str) -> Dict[str, Any]:
     return {
         "ok": False,
         "rootSource": "none",
+        "witnessTimes": {},
         "properties": {
             "commitmentVerified": False,
             "contentVerified": False,
@@ -564,7 +656,8 @@ def _invalid(reason: str) -> Dict[str, Any]:
 # Imported after the primitives to keep the public ledger namespace backwards compatible.
 from .ledger_advanced import (
     EVIDENCE_BUNDLE_KIND, CHAIN_TAG, GENESIS_PREV_CHAIN_HASH,
-    verify_embedded_signature, derive_verification_level,
+    verify_embedded_signature, derive_verification_level, leaf_count_mismatch,
     parse_rekor_evidence, rekor_payload_hash_for, verify_rekor_anchor, verify_anchor_quorum,
     chain_preimage, chain_hash, verify_roots_chain, verify_evidence_bundle,
 )
+from .rfc3161 import verify_rfc3161_anchor

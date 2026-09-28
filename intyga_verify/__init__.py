@@ -9,6 +9,7 @@ Rust, and Java verifiers by shared cross-language test vectors.
 # NOTE: the pre-DIV canonical_authorization_payload / _v3 builders were removed with the v2/v3
 # formats (ADR 005/014) — do not re-add them here; verify_approval_receipt rejects v != 1.
 from . import ledger
+from .rfc3161 import verify_rfc3161_anchor
 from .crypto import (
     canonical_agent_authority_payload,
     canonical_platform_intent_payload,
@@ -32,10 +33,13 @@ from .crypto import (
     canonical_delegation_payload,
     verify_delegation,
     NonCanonicalValue,
+    # DIV §5 step 3d: the refusal stem for a signed requirement below expected["requirement"].
+    WEAKER_REQUIREMENT_REASON,
 )
 
 __all__ = [
     "ledger",
+    "verify_rfc3161_anchor",
     "canonical_agent_authority_payload",
     "canonical_platform_intent_payload",
     "verify_agent_authority",
@@ -55,4 +59,5 @@ __all__ = [
     "verification_code",
     "verify_ecdsa_p256",
     "verify_approval_receipt",
+    "WEAKER_REQUIREMENT_REASON",
 ]
