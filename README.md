@@ -108,8 +108,8 @@ legacy key is accepted only when exactly one issuer is trusted.
 
 Limits remain explicit: no NDJSON evidence streaming and no WEBHOOK
 anchor verifier. Those anchors do not count toward quorum. No implementation claims the complete
-DEWP Extended Profile (§9.2). Embedded WebAuthn material is incomplete in the audit leaf; verify the
-full DIV receipt separately. Offline authority verification checks the seal, not subsequent online
+DEWP Extended Profile (§9.2). WebAuthn audit signatures require profile-carried assertion data and caller trust; verify the
+full DIV receipt separately for authorization and quorum. Offline authority verification checks the seal, not subsequent online
 revocation. Verification does not consume a nonce or prove execution.
 
 ## Also available in
@@ -121,3 +121,29 @@ revocation. Verification does not consume a nonce or prove execution.
 ## License
 
 Apache-2.0.
+
+
+### Audit event signatures
+
+The `trust.intyga.audit.v1` profile carries WebAuthn assertion data in the committed
+`canonical.metadata.webauthn.authenticatorData` and `clientDataJSON` fields. Both single-proof and
+bulk-evidence verification check these assertions when given caller-owned signer trust. This is a
+signature over the exact `signedPayload`, not approval quorum, action authorization, hardware
+attestation, current credential status or proof that the deploy executed. Verify the full DIV receipt
+against the expected operation and approval policy for those authorization checks.
+
+The per-event signature result distinguishes `verified`, `invalid`, `not_checked` (missing trust,
+missing material or unsupported algorithm) and `not_applicable` (unsigned/system or AUTO_APPROVED).
+A reason accompanies each status. `trusted: true` requires a valid signature under a caller-supplied
+key mapped to that signer DID. WebAuthn requires caller-selected origin and RP ID, user presence and
+user verification, and refuses cross-origin assertions. Supply COSE keys for WebAuthn and SPKI keys
+for ES256. Multiple keys per DID support deliberate key rotation; the evidence's key is never added
+to the caller's trusted set.
+
+Without a signature policy, legacy ES256 checks still use the embedded key and report `trusted: false`;
+WebAuthn reports `not_checked`. Diagnostic ledger validity does not imply signature validity. The
+strict signature option requires **every selected entry** to have a verified, caller-trusted signature;
+unsigned, redacted, incomplete and invalid entries fail that option. Anchor quorum is a separate policy.
+
+Pass `signature_policy={"trustedSigners": {did: [public_key]}, "expectedOrigin": origin, "expectedRpId": rp_id}`
+and `require_signatures=True` to `verify_bundle` / `verify_evidence_bundle`.

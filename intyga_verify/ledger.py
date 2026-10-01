@@ -371,7 +371,7 @@ def verify_anchor_signature(anchor: Dict[str, Any], public_key_spki_b64: str) ->
 # ── Bundle verification with the DEWP §7.1 property model ─────────────────────────────────────────
 def verify_bundle(bundle: Dict[str, Any], trusted_root: Optional[str] = None, *,
                   anchors=None, anchor_policy=None, resolve_anchor_key=None, external_keys=None,
-                  trusted_checkpoint=None) -> Dict[str, Any]:
+                  trusted_checkpoint=None, signature_policy=None, require_signatures=False) -> Dict[str, Any]:
     """Verify a single inclusion-proof bundle. Returns the four independent properties + summary level.
 
     `trusted_root` is independently obtained. Anchor verification additionally requires the
@@ -387,7 +387,7 @@ def verify_bundle(bundle: Dict[str, Any], trusted_root: Optional[str] = None, *,
     try:
         return _verify_bundle_checked(bundle, trusted_root, anchors=anchors, anchor_policy=anchor_policy,
                                       resolve_anchor_key=resolve_anchor_key, external_keys=external_keys,
-                                      trusted_checkpoint=trusted_checkpoint)
+                                      trusted_checkpoint=trusted_checkpoint, signature_policy=signature_policy, require_signatures=require_signatures)
     except Exception as exc:
         return _invalid(f"malformed bundle or verification input ({type(exc).__name__})")
 
@@ -408,7 +408,7 @@ def _supported_envelope(bundle):
 
 
 def _verify_bundle_checked(bundle, trusted_root, *, anchors, anchor_policy, resolve_anchor_key, external_keys,
-                           trusted_checkpoint=None):
+                           trusted_checkpoint=None, signature_policy=None, require_signatures=False):
     notes: List[str] = []
     if trusted_checkpoint is not None and not isinstance(trusted_checkpoint, dict):
         return _invalid("trusted_checkpoint must be a checkpoint record")
@@ -545,7 +545,8 @@ def _verify_bundle_checked(bundle, trusted_root, *, anchors, anchor_policy, reso
     # bundle DID ship. Mirrors `contentBoundWhenPresent` in @intyga/verify ledger-bundle.ts.
     content_bound_when_present = (leaf_binding is True) if canonical is not None else True
 
-    signature_verified = bool(content_verified and canonical and verify_embedded_signature(canonical))
+    signature = verify_audit_signature(canonical, signature_policy) if content_verified and canonical else unchecked_signature()
+    signature_verified = signature["status"] == "verified"
     anchor_verified, divergence = False, False
     witness_times: Dict[str, int] = {}
     external_check = bool(external_keys and (external_keys.get("rekor") or external_keys.get("rfc3161")))
@@ -598,11 +599,7 @@ def _verify_bundle_checked(bundle, trusted_root, *, anchors, anchor_policy, reso
         "signatureVerified": signature_verified,
         "anchorVerified": anchor_verified,
     }
-    has_signer = bool(
-        isinstance(canonical, dict)
-        and canonical.get("signature")
-        and canonical.get("signerPublicKey")
-    )
+    has_signer = signature["status"] != "not_applicable"
     if divergence or not commitment_verified:
         level = "INVALID"
     elif not content_verified:
@@ -624,11 +621,13 @@ def _verify_bundle_checked(bundle, trusted_root, *, anchors, anchor_policy, reso
             and content_bound_when_present
             and not divergence
             and (anchor_policy is None or anchor_verified)
+            and (not require_signatures or (signature_verified and signature["trusted"]))
         ),
         "dailyRoot": daily_root,
         "rootSource": root_source,
         "witnessTimes": witness_times,
         "properties": properties,
+        "signature": signature,
         "checks": {"leafBinding": leaf_binding, "headerBinding": header_binding},
         "verificationLevel": level,
         "notes": notes,
@@ -656,7 +655,7 @@ def _invalid(reason: str) -> Dict[str, Any]:
 # Imported after the primitives to keep the public ledger namespace backwards compatible.
 from .ledger_advanced import (
     EVIDENCE_BUNDLE_KIND, CHAIN_TAG, GENESIS_PREV_CHAIN_HASH,
-    verify_embedded_signature, derive_verification_level, leaf_count_mismatch,
+    verify_embedded_signature, verify_audit_signature, unchecked_signature, derive_verification_level, leaf_count_mismatch,
     parse_rekor_evidence, rekor_payload_hash_for, verify_rekor_anchor, verify_anchor_quorum,
     chain_preimage, chain_hash, verify_roots_chain, verify_evidence_bundle,
 )

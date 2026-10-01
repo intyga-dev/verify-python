@@ -58,6 +58,50 @@ def verify_embedded_signature(canonical: Dict[str, Any]) -> bool:
         return False
 
 
+def unchecked_signature():
+    return {"status": "not_checked", "reason": "Content not verified or unavailable.", "trusted": False}
+
+
+def verify_audit_signature(c, policy=None):
+    """Committed signature only, not authorization/quorum. Policy is independently provisioned."""
+    from .crypto import _verify_witness
+    def result(status, reason, trusted=False):
+        return {"status": status, "reason": reason, "trusted": trusted}
+    alg = c.get("sigAlg")
+    if not alg and (c.get("signature") or c.get("signedPayload") or c.get("signerPublicKey")):
+        return result("not_checked", "Signature algorithm is missing.")
+    if not alg or alg == "AUTO_APPROVED":
+        return result("not_applicable", "No human signature is declared.")
+    if alg not in ("ES256", "WEBAUTHN"):
+        return result("not_checked", "Unsupported signature algorithm.")
+    if not c.get("signature") or not c.get("signedPayload"):
+        return result("not_checked", "Signature or signed payload is missing.")
+    if policy is None and alg == "ES256":
+        if not c.get("signerPublicKey"):
+            return result("not_checked", "Signer public key is missing.")
+        return (result("verified", "Signature valid under embedded key; signer identity is not established.")
+                if verify_embedded_signature(c) else result("invalid", "Signature does not verify."))
+    keys = (policy or {}).get("trustedSigners", {}).get(c.get("signerDid"))
+    if not isinstance(keys, list) or not keys or not all(isinstance(k, str) and k for k in keys):
+        return result("not_checked", "No caller-trusted key for this signer.")
+    if alg == "WEBAUTHN" and (not policy.get("expectedOrigin") or not policy.get("expectedRpId")):
+        return result("not_checked", "Caller-selected WebAuthn origin and RP ID are required.")
+    m = c.get("metadata")
+    w = m.get("webauthn") if isinstance(m, dict) else None
+    w = w if isinstance(w, dict) else {}
+    if alg == "WEBAUTHN" and not all(isinstance(w.get(k), str) and w[k] for k in ("authenticatorData", "clientDataJSON")):
+        return result("not_checked", "WebAuthn authenticatorData or clientDataJSON is missing.")
+    for key in keys:
+        try:
+            ok, _ = _verify_witness({**w, "sigAlg": alg, "signature": c["signature"]}, key,
+                                   c["signedPayload"], policy.get("expectedOrigin"), policy.get("expectedRpId"), True, False)
+            if ok:
+                return result("verified", "Signature valid under caller-trusted signer key.", True)
+        except Exception:
+            pass
+    return result("invalid", "Signature or WebAuthn assertion does not verify under caller trust.")
+
+
 def derive_verification_level(properties, has_signer: bool) -> str:
     if not properties["commitmentVerified"]:
         return "INVALID"
@@ -361,7 +405,8 @@ def leaf_count_mismatch(proof, entry_count):
 
 @_safe_result("evidence bundle")
 def verify_evidence_bundle(bundle, *, trusted_roots=None, anchors=None, anchor_policy=None,
-                           resolve_anchor_key=None, external_keys=None, trusted_checkpoints=None):
+                           resolve_anchor_key=None, external_keys=None, trusted_checkpoints=None,
+                           signature_policy=None, require_signatures=False):
     """Verify a multi-event export, including committed counters and optional anchor quorum.
 
     ``trusted_checkpoints`` are checkpoint records YOU hold (chain-verified roots-file lines, DEWP
@@ -372,6 +417,7 @@ def verify_evidence_bundle(bundle, *, trusted_roots=None, anchors=None, anchor_p
     failed, notes, roots = [], [], []
     content, commitment, redacted = 0, 0, 0
     signatures = {"verified": 0, "invalid": [], "notCheckable": 0}
+    signature_checks = {}
     entries, checkpoints = bundle["entries"], bundle["checkpoints"]
     if not isinstance(entries, list) or not isinstance(checkpoints, list):
         raise ValueError("entries/checkpoints must be arrays")
@@ -506,11 +552,12 @@ def verify_evidence_bundle(bundle, *, trusted_roots=None, anchors=None, anchor_p
             if canonical.get("tenantId") is not None and canonical["tenantId"] != tenant:
                 failed.append({"seq": seq, "reason": "entry belongs to another tenant"})
                 continue
-            if canonical.get("sigAlg") == "ES256" and canonical.get("signature") and canonical.get("signerPublicKey"):
-                if verify_embedded_signature(canonical):
-                    signatures["verified"] += 1
-                else:
-                    signatures["invalid"].append({"seq": seq})
+            check = verify_audit_signature(canonical, signature_policy)
+            signature_checks[seq] = check
+            if check["status"] == "verified":
+                signatures["verified"] += 1
+            elif check["status"] == "invalid":
+                signatures["invalid"].append({"seq": seq})
             else:
                 signatures["notCheckable"] += 1
             content += 1
@@ -604,8 +651,13 @@ def verify_evidence_bundle(bundle, *, trusted_roots=None, anchors=None, anchor_p
         notes.append("Some caller anchor keys name unknown checkpoints; they cannot establish divergence")
     if not can_check:
         notes.append("No complete anchor policy or caller trust supplied; no anchor quorum evaluated")
+    signatures["checks"] = [{"seq": e["event"]["seq"], **signature_checks.get(e["event"]["seq"], unchecked_signature())} for e in entries]
+    if require_signatures:
+        for check in signatures["checks"]:
+            if check["status"] != "verified" or not check["trusted"]:
+                failed.append({"seq": check["seq"], "reason": "Required trusted signature: " + check["reason"]})
     if signatures["invalid"]:
-        notes.append("Committed ES256 signature material does not verify; this is not bundle tampering")
+        notes.append("Committed signature material does not verify; this is not bundle tampering")
     all_anchored = anchor_policy is None or (can_check and all(r["anchorVerified"] is True for r in roots))
     return {"ok": not failed and bool(entries) and trusted is not None and all_anchored,
             "total": len(entries), "contentVerified": content, "commitmentOnly": commitment,

@@ -11,6 +11,10 @@ entry below describes a change to that extracted surface, which usually arrives 
 
 ## [Unreleased]
 
+- Verify profile-carried WebAuthn audit signatures with caller-trusted signer keys, origin and RP ID.
+  Report explicit per-event signature status and key trust; add strict signature acceptance for
+  single and bulk evidence. Audit signature checks do not replace full approval-receipt verification.
+
 - **DIV 1.0 pre-release correction (H1):** `verify_approval_receipt`, `verify_delegation` and
   `verify_agent_authority` accept `expected["requirement"]`; export `WEAKER_REQUIREMENT_REASON`. The
   signed `requirement` is authored by the signers, so one approver (possibly the requester) could
