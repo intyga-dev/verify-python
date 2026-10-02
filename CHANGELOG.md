@@ -11,6 +11,11 @@ entry below describes a change to that extracted surface, which usually arrives 
 
 ## [Unreleased]
 
+## [1.0.0]
+
+- Packaging: require setuptools 77+ for SPDX license metadata; include the changelog, tests and
+  shared vectors in the source distribution.
+
 - Verify profile-carried WebAuthn audit signatures with caller-trusted signer keys, origin and RP ID.
   Report explicit per-event signature status and key trust; add strict signature acceptance for
   single and bulk evidence. Audit signature checks do not replace full approval-receipt verification.
@@ -56,12 +61,11 @@ entry below describes a change to that extracted surface, which usually arrives 
   signature could verify. The minimum is now enforced explicitly rather than by an undocumented
   floor, and `True` is rejected along with `0` — in Python a bool is an int.
 
-## [1.0.0]
 
 Initial public release.
 
 - Offline approval-receipt verification (ES256 and WebAuthn) against a caller-supplied trust
-  anchor — no Intyga secret, no network. Depends only on `cryptography`.
+  anchor — no INTYGA secret, no network. Depends only on `cryptography`.
 - Canonical payload reconstruction held byte-identical to the TypeScript, Go, Rust and Java
   verifiers by the shared cross-language golden vectors.
 - DEWP Core Profile primitives and §5.2 single-anchor signature verification. §5.3 anchor-quorum

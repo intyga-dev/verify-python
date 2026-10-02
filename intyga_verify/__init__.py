@@ -1,6 +1,6 @@
-"""intyga-verify — offline verification of Intyga approval receipts.
+"""intyga-verify — offline verification of INTYGA approval receipts.
 
-The verifier and its canonicalization helpers, with no Intyga secret and no network. This is the
+The verifier and its canonicalization helpers, with no INTYGA secret and no network. This is the
 verify-only surface of the Python SDK, published on its own so a relying party that only needs to
 verify receipts does not have to install the full client. Kept byte-identical to the TypeScript, Go,
 Rust, and Java verifiers by shared cross-language test vectors.

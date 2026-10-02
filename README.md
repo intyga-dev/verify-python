@@ -1,8 +1,8 @@
-# intyga-verify — Offline Intyga receipt verification for Python
+# intyga-verify — Offline INTYGA receipt verification for Python
 
-Independently confirm that a human cryptographically approved **exactly** the action you are about to run — in your own process, with no Intyga secret and no network call. You recompute the canonical payload from your own parameters, check it byte-matches what was signed, and verify the human's **ES256** or **WebAuthn** signature.
+Independently confirm that a human cryptographically approved **exactly** the action you are about to run — in your own process, with no INTYGA secret and no network call. You recompute the canonical payload from your own parameters, check it byte-matches what was signed, and verify the human's **ES256** or **WebAuthn** signature.
 
-Depends only on [`cryptography`](https://pypi.org/project/cryptography/). This is the verify-only surface of the Intyga Python SDK, published on its own so a relying party that only needs verification does not install the full client. Its canonicalization is held byte-identical to the TypeScript, Go, Rust, and Java verifiers by shared cross-language test vectors.
+Depends only on [`cryptography`](https://pypi.org/project/cryptography/). This is the verify-only surface of the INTYGA Python SDK, published on its own so a relying party that only needs verification does not install the full client. Its canonicalization is held byte-identical to the TypeScript, Go, Rust, and Java verifiers by shared cross-language test vectors.
 
 > Status: **not yet published** to PyPI. The full client (which bundles this verifier) is [`sdk-python`](https://github.com/intyga-dev/sdk-python).
 
