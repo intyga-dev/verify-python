@@ -4,7 +4,7 @@ Independently confirm that a human cryptographically approved **exactly** the ac
 
 Depends only on [`cryptography`](https://pypi.org/project/cryptography/). This is the verify-only surface of the INTYGA Python SDK, published on its own so a relying party that only needs verification does not install the full client. Its canonicalization is held byte-identical to the TypeScript, Go, Rust, and Java verifiers by shared cross-language test vectors.
 
-> Status: **not yet published** to PyPI. The full client (which bundles this verifier) is [`sdk-python`](https://github.com/intyga-dev/sdk-python).
+> The full client (which bundles this verifier) is [`sdk-python`](https://github.com/intyga-dev/sdk-python).
 
 ## Install
 
