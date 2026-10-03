@@ -11,6 +11,11 @@ entry below describes a change to that extracted surface, which usually arrives 
 
 ## [Unreleased]
 
+## [1.1.0]
+
+- No code change. The matched set moves together (`pnpm test:versions`); this release carries the
+  new `@intyga/sdk` CLI options and the `require-approval` Action update.
+
 ## [1.0.0]
 
 - Packaging: require setuptools 77+ for SPDX license metadata; include the changelog, tests and
